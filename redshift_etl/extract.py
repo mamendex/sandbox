@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from typing import Callable
 
 import pandas as pd
 
-from redshift_etl.discover import TableModel
+from redshift_etl.discover import DEFAULT_CONFIG_DIR, TableModel
 
 QueryFn = Callable[[str], pd.DataFrame]
 
@@ -38,16 +39,56 @@ def resolve_key(columns: list[str]) -> tuple[list[str], str]:
     raise ValueError("nenhuma coluna 'id'/'id_c' encontrada para ordenar e particionar")
 
 
-def build_page_query(
-    schema: str, table: str, columns: list[str], order_by: list[str], page_size: int, offset: int
-) -> str:
+def build_query_template(schema: str, table: str, columns: list[str], order_by: list[str]) -> str:
+    """Monta a query de select da tabela, com placeholders `{page_size}`/`{offset}` para paginação."""
     cols_sql = ", ".join(f'"{c}"' for c in columns)
     order_sql = ", ".join(f'"{c}"' for c in order_by)
     return (
         f'SELECT {cols_sql} FROM "{schema}"."{table}" '
         f"ORDER BY {order_sql} "
-        f"LIMIT {page_size} OFFSET {offset}"
+        "LIMIT {page_size} OFFSET {offset}"
     )
+
+
+def table_query_path(schema: str, table: str, config_dir: str = DEFAULT_CONFIG_DIR) -> str:
+    return os.path.join(config_dir, schema, f"{table}.json")
+
+
+def save_table_query(
+    schema: str,
+    table: str,
+    columns: list[str],
+    order_by: list[str],
+    partition_column: str,
+    query_template: str,
+    config_dir: str = DEFAULT_CONFIG_DIR,
+) -> str:
+    """Persiste a query de select (e a estratégia de ordenação/particionamento) de uma tabela."""
+    table_dir = os.path.join(config_dir, schema)
+    os.makedirs(table_dir, exist_ok=True)
+    path = table_query_path(schema, table, config_dir)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "schema": schema,
+                "table": table,
+                "columns": columns,
+                "order_by": order_by,
+                "partition_column": partition_column,
+                "select_query": query_template,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return path
+
+
+def load_table_query(schema: str, table: str, config_dir: str = DEFAULT_CONFIG_DIR) -> dict:
+    """Carrega a query de select de uma tabela previamente salva por `extract_table`."""
+    path = table_query_path(schema, table, config_dir)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def bucket_for(value, num_buckets: int) -> int:
@@ -71,9 +112,16 @@ def extract_table(
     output_dir: str,
     page_size: int = 50_000,
     num_buckets: int = 32,
+    config_dir: str = DEFAULT_CONFIG_DIR,
 ) -> dict:
-    """Extrai uma tabela de forma paginada e grava parquet particionado por bucket."""
+    """Extrai uma tabela de forma paginada e grava parquet particionado por bucket.
+
+    A query de select usada (com a ordenação/particionamento escolhidos) é
+    persistida em `<config_dir>/<schema>/<table>.json`.
+    """
     order_by, partition_col = resolve_key(columns)
+    query_template = build_query_template(schema, table, columns, order_by)
+    save_table_query(schema, table, columns, order_by, partition_col, query_template, config_dir)
 
     table_dir = os.path.join(output_dir, schema, table)
     os.makedirs(table_dir, exist_ok=True)
@@ -82,7 +130,7 @@ def extract_table(
     pages = 0
     offset = 0
     while offset < row_count:
-        sql = build_page_query(schema, table, columns, order_by, page_size, offset)
+        sql = query_template.format(page_size=page_size, offset=offset)
         page_df = query(sql)
         if page_df.empty:
             break
@@ -108,15 +156,21 @@ def extract_all(
     output_dir: str,
     page_size: int = 50_000,
     num_buckets: int = 32,
+    config_dir: str = DEFAULT_CONFIG_DIR,
 ) -> pd.DataFrame:
-    """Extrai todas as tabelas com ao menos uma linha e monta o relatório final."""
+    """Extrai todas as tabelas com ao menos uma linha e monta o relatório final.
+
+    `model` pode vir de `discover()` (fluxo online) ou de `load_model()` (fluxo a
+    partir da configuração salva em `config_dir`).
+    """
     results = []
     for table in model.tables_with_rows():
         columns = model.tables[table]
         row_count = model.row_counts[table]
         try:
             stats = extract_table(
-                query, model.schema, table, columns, row_count, output_dir, page_size, num_buckets
+                query, model.schema, table, columns, row_count, output_dir,
+                page_size, num_buckets, config_dir,
             )
         except ValueError as exc:
             stats = {

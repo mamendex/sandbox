@@ -6,12 +6,16 @@ Redshift (ver README do pacote).
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from typing import Callable
 
 import pandas as pd
 
 QueryFn = Callable[[str], pd.DataFrame]
+
+DEFAULT_CONFIG_DIR = "config"
 
 
 @dataclass
@@ -47,8 +51,34 @@ def get_row_counts(query: QueryFn, schema: str, tables: list[str]) -> dict[str, 
     return counts
 
 
-def discover(query: QueryFn, schema: str) -> TableModel:
-    """Descobre o modelo completo (colunas + contagem de linhas) de um schema."""
+def model_path(schema: str, config_dir: str = DEFAULT_CONFIG_DIR) -> str:
+    return os.path.join(config_dir, f"{schema}.json")
+
+
+def save_model(model: TableModel, config_dir: str = DEFAULT_CONFIG_DIR) -> str:
+    """Persiste o modelo descoberto (colunas + contagem de linhas) em `<config_dir>/<schema>.json`."""
+    os.makedirs(config_dir, exist_ok=True)
+    path = model_path(model.schema, config_dir)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"schema": model.schema, "tables": model.tables, "row_counts": model.row_counts},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return path
+
+
+def load_model(schema: str, config_dir: str = DEFAULT_CONFIG_DIR) -> TableModel:
+    """Carrega um modelo previamente salvo por `discover`/`save_model`, sem acessar o Redshift."""
+    path = model_path(schema, config_dir)
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return TableModel(schema=data["schema"], tables=data["tables"], row_counts=data["row_counts"])
+
+
+def discover(query: QueryFn, schema: str, config_dir: str = DEFAULT_CONFIG_DIR) -> TableModel:
+    """Descobre o modelo completo (colunas + contagem de linhas) de um schema e persiste em JSON."""
     columns_df = get_columns(query, schema)
 
     tables: dict[str, list[str]] = {}
@@ -57,4 +87,6 @@ def discover(query: QueryFn, schema: str) -> TableModel:
 
     row_counts = get_row_counts(query, schema, list(tables.keys()))
 
-    return TableModel(schema=schema, tables=tables, row_counts=row_counts)
+    model = TableModel(schema=schema, tables=tables, row_counts=row_counts)
+    save_model(model, config_dir)
+    return model
