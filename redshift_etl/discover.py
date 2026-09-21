@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -45,9 +46,16 @@ def get_columns(query: QueryFn, schema: str) -> pd.DataFrame:
 def get_row_counts(query: QueryFn, schema: str, tables: list[str]) -> dict[str, int]:
     """Conta as linhas de cada tabela do schema (uma query COUNT(*) por tabela)."""
     counts: dict[str, int] = {}
-    for table in tables:
+    for i, table in enumerate(tables, start=1):
+        start = time.perf_counter()
+        print(f"[get_row_counts] ({i}/{len(tables)}) contando {schema}.{table}...", flush=True)
         sql = f'SELECT COUNT(*) AS row_count FROM "{schema}"."{table}"'
         counts[table] = int(query(sql)["row_count"].iloc[0])
+        print(
+            f"[get_row_counts] {schema}.{table}: {counts[table]} linhas "
+            f"({time.perf_counter() - start:.1f}s)",
+            flush=True,
+        )
     return counts
 
 
@@ -79,14 +87,19 @@ def load_model(schema: str, config_dir: str = DEFAULT_CONFIG_DIR) -> TableModel:
 
 def discover(query: QueryFn, schema: str, config_dir: str = DEFAULT_CONFIG_DIR) -> TableModel:
     """Descobre o modelo completo (colunas + contagem de linhas) de um schema e persiste em JSON."""
+    start = time.perf_counter()
+    print(f"[discover] iniciando descoberta do schema {schema}...", flush=True)
+
     columns_df = get_columns(query, schema)
 
     tables: dict[str, list[str]] = {}
     for table, group in columns_df.groupby("table_name", sort=False):
         tables[table] = group.sort_values("ordinal_position")["column_name"].tolist()
+    print(f"[discover] {len(tables)} tabelas encontradas em {schema}, contando linhas...", flush=True)
 
     row_counts = get_row_counts(query, schema, list(tables.keys()))
 
     model = TableModel(schema=schema, tables=tables, row_counts=row_counts)
     save_model(model, config_dir)
+    print(f"[discover] concluido em {time.perf_counter() - start:.1f}s", flush=True)
     return model

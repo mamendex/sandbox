@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pandas as pd
 
@@ -37,9 +38,16 @@ class TableLoader:
         if not os.path.isdir(path):
             raise FileNotFoundError(f"tabela '{table}' não encontrada em {path}")
 
+        start = time.perf_counter()
+        print(f"[TableLoader.load] lendo {self.schema}.{table} de {path}...", flush=True)
         df = pd.read_parquet(path, columns=columns, engine="pyarrow")
         if drop_bucket and "bucket" in df.columns:
             df = df.drop(columns=["bucket"])
+        print(
+            f"[TableLoader.load] {self.schema}.{table}: {len(df)} linhas "
+            f"({time.perf_counter() - start:.1f}s)",
+            flush=True,
+        )
         return df
 
     def __getitem__(self, table: str) -> pd.DataFrame:

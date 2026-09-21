@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from typing import Callable
 
 import pandas as pd
@@ -137,6 +138,9 @@ def extract_table(
 
     target_rows = row_count if sample_size is None else min(row_count, sample_size)
 
+    start = time.perf_counter()
+    print(f"[extract_table] iniciando {schema}.{table}: {target_rows} linhas alvo, page_size={page_size}", flush=True)
+
     rows_read = 0
     pages = 0
     offset = 0
@@ -150,6 +154,17 @@ def extract_table(
         rows_read += len(page_df)
         pages += 1
         offset += current_page_size
+        print(
+            f"[extract_table] {schema}.{table}: pagina {pages} lida, "
+            f"{rows_read}/{target_rows} linhas ({time.perf_counter() - start:.1f}s)",
+            flush=True,
+        )
+
+    print(
+        f"[extract_table] {schema}.{table} concluida: {rows_read} linhas em {pages} paginas "
+        f"({time.perf_counter() - start:.1f}s)",
+        flush=True,
+    )
 
     return {
         "table_name": table,
@@ -180,10 +195,15 @@ def extract_all(
     Com `sample_size`, cada tabela é limitada às suas primeiras `sample_size`
     linhas em vez de extraída por completo (útil para testes/dev).
     """
+    tables = model.tables_with_rows()
+    start = time.perf_counter()
+    print(f"[extract_all] iniciando extracao de {len(tables)} tabelas do schema {model.schema}", flush=True)
+
     results = []
-    for table in model.tables_with_rows():
+    for i, table in enumerate(tables, start=1):
         columns = model.tables[table]
         row_count = model.row_counts[table]
+        print(f"[extract_all] tabela {i}/{len(tables)}: {table}", flush=True)
         try:
             stats = extract_table(
                 query, model.schema, table, columns, row_count, output_dir,
@@ -201,6 +221,8 @@ def extract_all(
                 "output_path": None,
             }
         results.append(stats)
+
+    print(f"[extract_all] concluido em {time.perf_counter() - start:.1f}s", flush=True)
 
     return pd.DataFrame(
         results,
