@@ -62,6 +62,7 @@ def save_table_query(
     partition_column: str,
     query_template: str,
     config_dir: str = DEFAULT_CONFIG_DIR,
+    sample_size: int | None = None,
 ) -> str:
     """Persiste a query de select (e a estratégia de ordenação/particionamento) de uma tabela."""
     table_dir = os.path.join(config_dir, schema)
@@ -76,6 +77,7 @@ def save_table_query(
                 "order_by": order_by,
                 "partition_column": partition_column,
                 "select_query": query_template,
+                "sample_size": sample_size,
             },
             f,
             ensure_ascii=False,
@@ -113,36 +115,47 @@ def extract_table(
     page_size: int = 50_000,
     num_buckets: int = 32,
     config_dir: str = DEFAULT_CONFIG_DIR,
+    sample_size: int | None = None,
 ) -> dict:
     """Extrai uma tabela de forma paginada e grava parquet particionado por bucket.
+
+    Com `sample_size`, extrai só as primeiras `sample_size` linhas (na mesma
+    ordenação usada para a extração completa) em vez da tabela inteira — útil
+    para testes/dev sem ler a base toda.
 
     A query de select usada (com a ordenação/particionamento escolhidos) é
     persistida em `<config_dir>/<schema>/<table>.json`.
     """
     order_by, partition_col = resolve_key(columns)
     query_template = build_query_template(schema, table, columns, order_by)
-    save_table_query(schema, table, columns, order_by, partition_col, query_template, config_dir)
+    save_table_query(
+        schema, table, columns, order_by, partition_col, query_template, config_dir, sample_size
+    )
 
     table_dir = os.path.join(output_dir, schema, table)
     os.makedirs(table_dir, exist_ok=True)
 
+    target_rows = row_count if sample_size is None else min(row_count, sample_size)
+
     rows_read = 0
     pages = 0
     offset = 0
-    while offset < row_count:
-        sql = query_template.format(page_size=page_size, offset=offset)
+    while offset < target_rows:
+        current_page_size = min(page_size, target_rows - offset)
+        sql = query_template.format(page_size=current_page_size, offset=offset)
         page_df = query(sql)
         if page_df.empty:
             break
         _write_page(page_df, table_dir, partition_col, num_buckets)
         rows_read += len(page_df)
         pages += 1
-        offset += page_size
+        offset += current_page_size
 
     return {
         "table_name": table,
         "status": "ok",
         "rows_read": rows_read,
+        "sample_size": sample_size,
         "pages": pages,
         "order_by": ", ".join(order_by),
         "partition_column": partition_col,
@@ -157,11 +170,15 @@ def extract_all(
     page_size: int = 50_000,
     num_buckets: int = 32,
     config_dir: str = DEFAULT_CONFIG_DIR,
+    sample_size: int | None = None,
 ) -> pd.DataFrame:
     """Extrai todas as tabelas com ao menos uma linha e monta o relatório final.
 
     `model` pode vir de `discover()` (fluxo online) ou de `load_model()` (fluxo a
     partir da configuração salva em `config_dir`).
+
+    Com `sample_size`, cada tabela é limitada às suas primeiras `sample_size`
+    linhas em vez de extraída por completo (útil para testes/dev).
     """
     results = []
     for table in model.tables_with_rows():
@@ -170,13 +187,14 @@ def extract_all(
         try:
             stats = extract_table(
                 query, model.schema, table, columns, row_count, output_dir,
-                page_size, num_buckets, config_dir,
+                page_size, num_buckets, config_dir, sample_size,
             )
         except ValueError as exc:
             stats = {
                 "table_name": table,
                 "status": f"erro: {exc}",
                 "rows_read": 0,
+                "sample_size": sample_size,
                 "pages": 0,
                 "order_by": None,
                 "partition_column": None,
@@ -186,5 +204,8 @@ def extract_all(
 
     return pd.DataFrame(
         results,
-        columns=["table_name", "status", "rows_read", "pages", "order_by", "partition_column", "output_path"],
+        columns=[
+            "table_name", "status", "rows_read", "sample_size",
+            "pages", "order_by", "partition_column", "output_path",
+        ],
     )

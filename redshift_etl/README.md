@@ -50,6 +50,18 @@ direto do `discover()` (consulta o Redshift) ou a partir da configuração
 salva anteriormente via `load_model()` (sem acessar o Redshift para
 descobrir o modelo).
 
+## Extração parcial (`sample_size`)
+
+Para testes/dev, sem ler a base inteira, passe `sample_size` a
+`extract_table()`/`extract_all()`: cada tabela é limitada às suas primeiras
+`sample_size` linhas, na mesma ordenação usada na extração completa (então o
+sample é sempre o "topo" da ordenação, não linhas aleatórias). O valor usado
+fica registrado tanto no relatório quanto no JSON da tabela em `config_dir`.
+
+```python
+relatorio = extract_all(query, model, OUTPUT_DIR, sample_size=1_000)
+```
+
 ## Regras de ordenação e particionamento
 
 Para cada tabela, a ordenação (e paginação) usa a primeira combinação disponível:
