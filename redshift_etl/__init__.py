@@ -1,9 +1,9 @@
 """ETL simples para Redshift baseado em pandas: discover, extract, transform e validate."""
 
-from redshift_etl.discover import TableModel, discover, load_model, save_model
-from redshift_etl.extract import extract_all, extract_table, load_table_query, save_table_query
-from redshift_etl.transform import TableLoader
-from redshift_etl.validate import (
+from .discover import TableModel, discover, load_model, save_model
+from .extract import extract_all, extract_table, load_table_query, save_table_query
+from .transform import TableLoader
+from .validate import (
     CheckResult,
     check_duplicate_ids,
     check_duplicates_all,

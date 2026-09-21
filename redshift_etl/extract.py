@@ -10,7 +10,7 @@ from typing import Callable
 
 import pandas as pd
 
-from redshift_etl.discover import DEFAULT_CONFIG_DIR, TableModel
+from .discover import DEFAULT_CONFIG_DIR, TableModel
 
 QueryFn = Callable[[str], pd.DataFrame]
 
