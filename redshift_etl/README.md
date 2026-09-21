@@ -77,6 +77,28 @@ A coluna de particionamento dos parquets (`id` ou `id_c`, a que existir) é
 transformada em um bucket estável (`hash % num_buckets`) e gravada como
 partição `bucket=N` dentro de `OUTPUT_DIR/<schema>/<tabela>/`.
 
+## Schema consistente entre páginas (`column_types`)
+
+Cada página é gravada como um arquivo parquet separado. Se uma coluna de texto
+vier inteiramente `None` numa página específica, o pandas/pyarrow pode inferir
+o tipo dessa coluna, naquele arquivo, como `null` — diferente do `string`/`int`
+inferido em outras páginas onde a coluna tem valores reais. Ao ler o dataset
+completo (`TableLoader`, `check_row_counts`, `check_duplicate_ids`), o pyarrow
+precisa unificar os schemas dos arquivos e, em algumas versões, isso falha com
+`ArrowNotImplementedError: Unsupported cast from large_string to null`.
+
+Para evitar isso, `discover()` também guarda o `data_type` de cada coluna
+(`model.column_types[tabela][coluna]`, vindo de `information_schema.columns`)
+e `extract_table()`/`extract_all()` usam esse tipo para fixar o dtype de toda
+página antes de gravar — assim nenhuma página fica "adivinhando" sozinha o
+tipo de uma coluna totalmente nula. A coerção é best-effort: tipos não
+mapeados ou que falhem na conversão ficam como o pandas inferiu.
+
+> Modelos salvos por uma versão anterior (sem `column_types` no JSON) continuam
+> carregando normalmente com `load_model()` — nesse caso a coerção é pulada e o
+> comportamento fica igual ao de antes dessa correção. Rode `discover()` de
+> novo para atualizar o `config_dir` com os tipos.
+
 ## Validação da carga (`redshift_etl/validate.py`)
 
 ```python

@@ -22,6 +22,65 @@ _ORDER_PRIORITY = [
     ("date_created", "id_c"),
 ]
 
+# Mapeia o data_type do Redshift (information_schema.columns) para um dtype pandas.
+# Aplicado em toda página antes de gravar, para fixar o schema de cada coluna e
+# evitar que uma página com uma coluna inteiramente nula (ex.: texto opcional só
+# com None) seja inferida pelo pyarrow como tipo `null`, incompatível com o
+# `large_string`/`int64`/etc. das demais páginas na hora de ler o dataset completo.
+_REDSHIFT_TO_PANDAS_DTYPE = {
+    "smallint": "Int64",
+    "int2": "Int64",
+    "integer": "Int64",
+    "int": "Int64",
+    "int4": "Int64",
+    "bigint": "Int64",
+    "int8": "Int64",
+    "decimal": "float64",
+    "numeric": "float64",
+    "real": "float64",
+    "float4": "float64",
+    "double precision": "float64",
+    "float8": "float64",
+    "float": "float64",
+    "boolean": "boolean",
+    "bool": "boolean",
+    "char": "string",
+    "character": "string",
+    "nchar": "string",
+    "bpchar": "string",
+    "varchar": "string",
+    "character varying": "string",
+    "nvarchar": "string",
+    "text": "string",
+    "date": "datetime64[ns]",
+    "timestamp": "datetime64[ns]",
+    "timestamp without time zone": "datetime64[ns]",
+    "timestamptz": "datetime64[ns]",
+    "timestamp with time zone": "datetime64[ns]",
+}
+
+
+def _target_dtype(redshift_type: str) -> str | None:
+    key = redshift_type.strip().lower().split("(")[0].strip()
+    return _REDSHIFT_TO_PANDAS_DTYPE.get(key)
+
+
+def coerce_dtypes(df: pd.DataFrame, column_types: dict[str, str]) -> pd.DataFrame:
+    """Fixa o dtype de cada coluna conforme o `data_type` do Redshift (via `TableModel.column_types`).
+
+    Colunas cujo tipo não está mapeado, ou cuja conversão falhe, ficam como o
+    pandas inferiu — a coerção é best-effort, não uma validação de schema.
+    """
+    for column, redshift_type in column_types.items():
+        target = _target_dtype(redshift_type)
+        if target is None or column not in df.columns:
+            continue
+        try:
+            df[column] = df[column].astype(target)
+        except (TypeError, ValueError):
+            pass
+    return df
+
 
 def resolve_key(columns: list[str]) -> tuple[list[str], str]:
     """Escolhe as colunas de ORDER BY e a coluna de particionamento (id ou id_c).
@@ -117,12 +176,17 @@ def extract_table(
     num_buckets: int = 32,
     config_dir: str = DEFAULT_CONFIG_DIR,
     sample_size: int | None = None,
+    column_types: dict[str, str] | None = None,
 ) -> dict:
     """Extrai uma tabela de forma paginada e grava parquet particionado por bucket.
 
     Com `sample_size`, extrai só as primeiras `sample_size` linhas (na mesma
     ordenação usada para a extração completa) em vez da tabela inteira — útil
     para testes/dev sem ler a base toda.
+
+    `column_types` (de `TableModel.column_types[table]`) fixa o dtype de cada
+    coluna em toda página, evitando schemas inconsistentes entre parquets por
+    causa de páginas com colunas inteiramente nulas.
 
     A query de select usada (com a ordenação/particionamento escolhidos) é
     persistida em `<config_dir>/<schema>/<table>.json`.
@@ -150,6 +214,8 @@ def extract_table(
         page_df = query(sql)
         if page_df.empty:
             break
+        if column_types:
+            page_df = coerce_dtypes(page_df, column_types)
         _write_page(page_df, table_dir, partition_col, num_buckets)
         rows_read += len(page_df)
         pages += 1
@@ -203,11 +269,12 @@ def extract_all(
     for i, table in enumerate(tables, start=1):
         columns = model.tables[table]
         row_count = model.row_counts[table]
+        column_types = model.column_types.get(table, {})
         print(f"[extract_all] tabela {i}/{len(tables)}: {table}", flush=True)
         try:
             stats = extract_table(
                 query, model.schema, table, columns, row_count, output_dir,
-                page_size, num_buckets, config_dir, sample_size,
+                page_size, num_buckets, config_dir, sample_size, column_types,
             )
         except ValueError as exc:
             stats = {

@@ -21,10 +21,11 @@ DEFAULT_CONFIG_DIR = "config"
 
 @dataclass
 class TableModel:
-    """Modelo descoberto de um schema: colunas (em ordem) e contagem de linhas por tabela."""
+    """Modelo descoberto de um schema: colunas (em ordem), tipos e contagem de linhas por tabela."""
 
     schema: str
     tables: dict[str, list[str]] = field(default_factory=dict)
+    column_types: dict[str, dict[str, str]] = field(default_factory=dict)
     row_counts: dict[str, int] = field(default_factory=dict)
 
     def tables_with_rows(self) -> list[str]:
@@ -33,9 +34,9 @@ class TableModel:
 
 
 def get_columns(query: QueryFn, schema: str) -> pd.DataFrame:
-    """Busca tabelas e colunas (em ordem ordinal) de um schema."""
+    """Busca tabelas, colunas (em ordem ordinal) e o tipo de dado de um schema."""
     sql = f"""
-        SELECT table_name, column_name, ordinal_position
+        SELECT table_name, column_name, data_type, ordinal_position
         FROM information_schema.columns
         WHERE table_schema = '{schema}'
         ORDER BY table_name, ordinal_position
@@ -64,12 +65,17 @@ def model_path(schema: str, config_dir: str = DEFAULT_CONFIG_DIR) -> str:
 
 
 def save_model(model: TableModel, config_dir: str = DEFAULT_CONFIG_DIR) -> str:
-    """Persiste o modelo descoberto (colunas + contagem de linhas) em `<config_dir>/<schema>.json`."""
+    """Persiste o modelo descoberto (colunas, tipos e contagem de linhas) em `<config_dir>/<schema>.json`."""
     os.makedirs(config_dir, exist_ok=True)
     path = model_path(model.schema, config_dir)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(
-            {"schema": model.schema, "tables": model.tables, "row_counts": model.row_counts},
+            {
+                "schema": model.schema,
+                "tables": model.tables,
+                "column_types": model.column_types,
+                "row_counts": model.row_counts,
+            },
             f,
             ensure_ascii=False,
             indent=2,
@@ -82,24 +88,32 @@ def load_model(schema: str, config_dir: str = DEFAULT_CONFIG_DIR) -> TableModel:
     path = model_path(schema, config_dir)
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return TableModel(schema=data["schema"], tables=data["tables"], row_counts=data["row_counts"])
+    return TableModel(
+        schema=data["schema"],
+        tables=data["tables"],
+        column_types=data.get("column_types", {}),
+        row_counts=data["row_counts"],
+    )
 
 
 def discover(query: QueryFn, schema: str, config_dir: str = DEFAULT_CONFIG_DIR) -> TableModel:
-    """Descobre o modelo completo (colunas + contagem de linhas) de um schema e persiste em JSON."""
+    """Descobre o modelo completo (colunas, tipos e contagem de linhas) de um schema e persiste em JSON."""
     start = time.perf_counter()
     print(f"[discover] iniciando descoberta do schema {schema}...", flush=True)
 
     columns_df = get_columns(query, schema)
 
     tables: dict[str, list[str]] = {}
+    column_types: dict[str, dict[str, str]] = {}
     for table, group in columns_df.groupby("table_name", sort=False):
-        tables[table] = group.sort_values("ordinal_position")["column_name"].tolist()
+        group = group.sort_values("ordinal_position")
+        tables[table] = group["column_name"].tolist()
+        column_types[table] = dict(zip(group["column_name"], group["data_type"]))
     print(f"[discover] {len(tables)} tabelas encontradas em {schema}, contando linhas...", flush=True)
 
     row_counts = get_row_counts(query, schema, list(tables.keys()))
 
-    model = TableModel(schema=schema, tables=tables, row_counts=row_counts)
+    model = TableModel(schema=schema, tables=tables, column_types=column_types, row_counts=row_counts)
     save_model(model, config_dir)
     print(f"[discover] concluido em {time.perf_counter() - start:.1f}s", flush=True)
     return model
