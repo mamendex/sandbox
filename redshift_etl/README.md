@@ -1,6 +1,6 @@
 # redshift_etl
 
-ETL simples baseado em pandas para Redshift: discover -> extract -> transform.
+ETL simples baseado em pandas para Redshift: discover -> extract -> transform -> validate.
 Pensado para ser importado em notebooks Jupyter.
 
 Pré-requisito: uma função `query(sql) -> pandas.DataFrame` que execute a query
@@ -76,3 +76,43 @@ Para cada tabela, a ordenação (e paginação) usa a primeira combinação disp
 A coluna de particionamento dos parquets (`id` ou `id_c`, a que existir) é
 transformada em um bucket estável (`hash % num_buckets`) e gravada como
 partição `bucket=N` dentro de `OUTPUT_DIR/<schema>/<tabela>/`.
+
+## Validação da carga (`redshift_etl/validate.py`)
+
+```python
+from redshift_etl import check_row_counts, check_duplicates_all, check_unique, check_foreign_key, run_checks
+
+# linhas carregadas (parquet) x linhas esperadas (discover), por tabela
+check_row_counts(model, OUTPUT_DIR)
+
+# duplicidade da chave de particionamento (id/id_c) nos parquets de cada tabela
+check_duplicates_all(model, OUTPUT_DIR, config_dir=CONFIG_DIR)
+```
+
+- `count_loaded_rows(output_dir, schema, table)` / `check_row_counts(model, output_dir)`:
+  conta linhas lendo só metadados do parquet (sem carregar os dados) e compara
+  com a contagem levantada pelo `discover`.
+- `check_duplicate_ids(output_dir, schema, table, config_dir)` /
+  `check_duplicates_all(model, output_dir, config_dir)`: verifica se a coluna
+  usada para particionar/ordenar (`id` ou `id_c`, a mesma persistida em
+  `config_dir`) tem valores duplicados entre os parquets extraídos.
+
+Espaço para checks customizados de qualidade (chaves estrangeiras, chaves
+naturais únicas como cpf/cnpj, etc.): `check_unique(df, coluna, tabela)` e
+`check_foreign_key(df, coluna, ref_df, ref_coluna, tabela)` cobrem os casos
+comuns; escreva sua própria função com a mesma assinatura (retornando um
+`CheckResult`) para regras específicas, e rode tudo junto com `run_checks`:
+
+```python
+from functools import partial
+from redshift_etl import check_unique, check_foreign_key, run_checks
+
+df_clientes = loader.load("clientes")
+df_pedidos = loader.load("pedidos")
+
+checks = [
+    partial(check_unique, df_clientes, "cpf", "clientes"),
+    partial(check_foreign_key, df_pedidos, "cliente_id", df_clientes, "id", "pedidos"),
+]
+relatorio_qualidade = run_checks(checks)
+```
