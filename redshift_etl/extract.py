@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import time
 from typing import Callable
 
 import pandas as pd
 
+from .checkpoint import DEFAULT_CONTROL_DIR, clear_checkpoint, load_checkpoint, save_checkpoint
 from .discover import DEFAULT_CONFIG_DIR, TableModel
 
 QueryFn = Callable[[str], pd.DataFrame]
@@ -82,6 +84,24 @@ def coerce_dtypes(df: pd.DataFrame, column_types: dict[str, str]) -> pd.DataFram
     return df
 
 
+def _format_literal(value, redshift_type: str | None) -> str:
+    """Formata um valor de checkpoint como literal SQL (com aspas para texto/data)."""
+    target = _target_dtype(redshift_type) if redshift_type else None
+    if target in ("string", "datetime64[ns]") or (target is None and isinstance(value, str)):
+        escaped = str(value).replace("'", "''")
+        return f"'{escaped}'"
+    return str(value)
+
+
+def build_resume_filter(order_by: list[str], last_values: list, column_types: dict[str, str]) -> str:
+    """Monta o `WHERE (colunas) > (valores)` para retomar de um checkpoint (comparação por tupla:
+    continua exatamente depois da última linha extraída, sem pular nem duplicar linhas com o
+    mesmo valor de data quando a ordenação é data+id)."""
+    cols_sql = ", ".join(f'"{c}"' for c in order_by)
+    literals_sql = ", ".join(_format_literal(v, column_types.get(c)) for c, v in zip(order_by, last_values))
+    return f"({cols_sql}) > ({literals_sql})"
+
+
 def resolve_key(columns: list[str]) -> tuple[list[str], str]:
     """Escolhe as colunas de ORDER BY e a coluna de particionamento (id ou id_c).
 
@@ -99,12 +119,20 @@ def resolve_key(columns: list[str]) -> tuple[list[str], str]:
     raise ValueError("nenhuma coluna 'id'/'id_c' encontrada para ordenar e particionar")
 
 
-def build_query_template(schema: str, table: str, columns: list[str], order_by: list[str]) -> str:
-    """Monta a query de select da tabela, com placeholders `{page_size}`/`{offset}` para paginação."""
+def build_query_template(
+    schema: str, table: str, columns: list[str], order_by: list[str], where: str | None = None
+) -> str:
+    """Monta a query de select da tabela, com placeholders `{page_size}`/`{offset}` para paginação.
+
+    `where`, quando informado (ver `build_resume_filter`), filtra a partir de um checkpoint
+    para retomar uma carga incremental.
+    """
     cols_sql = ", ".join(f'"{c}"' for c in columns)
     order_sql = ", ".join(f'"{c}"' for c in order_by)
+    where_sql = f"WHERE {where} " if where else ""
     return (
         f'SELECT {cols_sql} FROM "{schema}"."{table}" '
+        f"{where_sql}"
         f"ORDER BY {order_sql} "
         "LIMIT {page_size} OFFSET {offset}"
     )
@@ -123,6 +151,8 @@ def save_table_query(
     query_template: str,
     config_dir: str = DEFAULT_CONFIG_DIR,
     sample_size: int | None = None,
+    load_mode: str = "incremental",
+    resumed_from: list | None = None,
 ) -> str:
     """Persiste a query de select (e a estratégia de ordenação/particionamento) de uma tabela."""
     table_dir = os.path.join(config_dir, schema)
@@ -138,6 +168,8 @@ def save_table_query(
                 "partition_column": partition_column,
                 "select_query": query_template,
                 "sample_size": sample_size,
+                "load_mode": load_mode,
+                "resumed_from": resumed_from,
             },
             f,
             ensure_ascii=False,
@@ -170,46 +202,81 @@ def extract_table(
     schema: str,
     table: str,
     columns: list[str],
-    row_count: int,
     output_dir: str,
     page_size: int = 50_000,
     num_buckets: int = 32,
     config_dir: str = DEFAULT_CONFIG_DIR,
     sample_size: int | None = None,
     column_types: dict[str, str] | None = None,
+    load_mode: str = "incremental",
+    control_dir: str = DEFAULT_CONTROL_DIR,
 ) -> dict:
     """Extrai uma tabela de forma paginada e grava parquet particionado por bucket.
 
-    Com `sample_size`, extrai só as primeiras `sample_size` linhas (na mesma
-    ordenação usada para a extração completa) em vez da tabela inteira — útil
-    para testes/dev sem ler a base toda.
+    `load_mode`:
+    - "incremental" (default): retoma do checkpoint salvo em `<control_dir>/<schema>/<table>/`
+      (últimos valores de `order_by` da carga anterior), lendo só as linhas novas dali em
+      diante. Sem checkpoint prévio, equivale a uma carga full.
+    - "full": ignora/descarta checkpoint e dados já extraídos dessa tabela em `output_dir`
+      e recomeça do zero.
+    Em ambos os casos, um novo checkpoint é salvo ao final com o último valor lido.
 
-    `column_types` (de `TableModel.column_types[table]`) fixa o dtype de cada
-    coluna em toda página, evitando schemas inconsistentes entre parquets por
-    causa de páginas com colunas inteiramente nulas.
+    Com `sample_size`, extrai só as primeiras `sample_size` linhas (a partir do ponto de
+    retomada) em vez da tabela/incremento inteiro — útil para testes/dev.
 
-    A query de select usada (com a ordenação/particionamento escolhidos) é
-    persistida em `<config_dir>/<schema>/<table>.json`.
+    `column_types` (de `TableModel.column_types[table]`) fixa o dtype de cada coluna em
+    toda página, evitando schemas inconsistentes entre parquets por causa de páginas com
+    colunas inteiramente nulas.
+
+    A query de select usada (com a ordenação/particionamento/filtro de retomada
+    escolhidos) é persistida em `<config_dir>/<schema>/<table>.json`.
     """
+    if load_mode not in ("full", "incremental"):
+        raise ValueError(f"load_mode inválido: {load_mode!r} (use 'full' ou 'incremental')")
+
     order_by, partition_col = resolve_key(columns)
-    query_template = build_query_template(schema, table, columns, order_by)
+    column_types = column_types or {}
+    table_dir = os.path.join(output_dir, schema, table)
+
+    resume_from = None
+    if load_mode == "full":
+        shutil.rmtree(table_dir, ignore_errors=True)
+        clear_checkpoint(schema, table, control_dir)
+    else:
+        checkpoint = load_checkpoint(schema, table, control_dir)
+        if checkpoint and checkpoint.get("order_by") == order_by:
+            resume_from = checkpoint["last_values"]
+        elif checkpoint:
+            print(
+                f"[extract_table] checkpoint de {schema}.{table} ignorado "
+                f"(ordenacao mudou: {checkpoint.get('order_by')} -> {order_by})",
+                flush=True,
+            )
+
+    where = build_resume_filter(order_by, resume_from, column_types) if resume_from else None
+    query_template = build_query_template(schema, table, columns, order_by, where)
     save_table_query(
-        schema, table, columns, order_by, partition_col, query_template, config_dir, sample_size
+        schema, table, columns, order_by, partition_col, query_template,
+        config_dir, sample_size, load_mode, resume_from,
     )
 
-    table_dir = os.path.join(output_dir, schema, table)
     os.makedirs(table_dir, exist_ok=True)
 
-    target_rows = row_count if sample_size is None else min(row_count, sample_size)
-
     start = time.perf_counter()
-    print(f"[extract_table] iniciando {schema}.{table}: {target_rows} linhas alvo, page_size={page_size}", flush=True)
+    print(
+        f"[extract_table] iniciando {schema}.{table} (load_mode={load_mode}"
+        + (f", retomando de {resume_from}" if resume_from else "")
+        + (f", sample_size={sample_size}" if sample_size is not None else "")
+        + ")",
+        flush=True,
+    )
 
     rows_read = 0
     pages = 0
     offset = 0
-    while offset < target_rows:
-        current_page_size = min(page_size, target_rows - offset)
+    last_row = None
+    while sample_size is None or rows_read < sample_size:
+        current_page_size = page_size if sample_size is None else min(page_size, sample_size - rows_read)
         sql = query_template.format(page_size=current_page_size, offset=offset)
         page_df = query(sql)
         if page_df.empty:
@@ -219,12 +286,18 @@ def extract_table(
         _write_page(page_df, table_dir, partition_col, num_buckets)
         rows_read += len(page_df)
         pages += 1
-        offset += current_page_size
+        offset += len(page_df)
+        last_row = page_df.iloc[-1]
         print(
             f"[extract_table] {schema}.{table}: pagina {pages} lida, "
-            f"{rows_read}/{target_rows} linhas ({time.perf_counter() - start:.1f}s)",
+            f"{rows_read} linhas ate agora ({time.perf_counter() - start:.1f}s)",
             flush=True,
         )
+        if len(page_df) < current_page_size:
+            break  # ultima pagina (menos linhas do que pedido)
+
+    if last_row is not None:
+        save_checkpoint(schema, table, order_by, [last_row[c] for c in order_by], control_dir)
 
     print(
         f"[extract_table] {schema}.{table} concluida: {rows_read} linhas em {pages} paginas "
@@ -236,6 +309,7 @@ def extract_table(
         "table_name": table,
         "status": "ok",
         "rows_read": rows_read,
+        "load_mode": load_mode,
         "sample_size": sample_size,
         "pages": pages,
         "order_by": ", ".join(order_by),
@@ -252,35 +326,42 @@ def extract_all(
     num_buckets: int = 32,
     config_dir: str = DEFAULT_CONFIG_DIR,
     sample_size: int | None = None,
+    load_mode: str = "incremental",
+    control_dir: str = DEFAULT_CONTROL_DIR,
 ) -> pd.DataFrame:
     """Extrai todas as tabelas com ao menos uma linha e monta o relatório final.
 
     `model` pode vir de `discover()` (fluxo online) ou de `load_model()` (fluxo a
     partir da configuração salva em `config_dir`).
 
-    Com `sample_size`, cada tabela é limitada às suas primeiras `sample_size`
-    linhas em vez de extraída por completo (útil para testes/dev).
+    `load_mode` ("incremental", default, ou "full") e `sample_size` são repassados
+    a `extract_table` para cada tabela — ver a docstring de `extract_table`.
     """
     tables = model.tables_with_rows()
     start = time.perf_counter()
-    print(f"[extract_all] iniciando extracao de {len(tables)} tabelas do schema {model.schema}", flush=True)
+    print(
+        f"[extract_all] iniciando extracao de {len(tables)} tabelas do schema {model.schema} "
+        f"(load_mode={load_mode})",
+        flush=True,
+    )
 
     results = []
     for i, table in enumerate(tables, start=1):
         columns = model.tables[table]
-        row_count = model.row_counts[table]
         column_types = model.column_types.get(table, {})
         print(f"[extract_all] tabela {i}/{len(tables)}: {table}", flush=True)
         try:
             stats = extract_table(
-                query, model.schema, table, columns, row_count, output_dir,
+                query, model.schema, table, columns, output_dir,
                 page_size, num_buckets, config_dir, sample_size, column_types,
+                load_mode, control_dir,
             )
         except ValueError as exc:
             stats = {
                 "table_name": table,
                 "status": f"erro: {exc}",
                 "rows_read": 0,
+                "load_mode": load_mode,
                 "sample_size": sample_size,
                 "pages": 0,
                 "order_by": None,
@@ -294,7 +375,7 @@ def extract_all(
     return pd.DataFrame(
         results,
         columns=[
-            "table_name", "status", "rows_read", "sample_size",
+            "table_name", "status", "rows_read", "load_mode", "sample_size",
             "pages", "order_by", "partition_column", "output_path",
         ],
     )

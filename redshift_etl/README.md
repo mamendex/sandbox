@@ -54,13 +54,54 @@ descobrir o modelo).
 
 Para testes/dev, sem ler a base inteira, passe `sample_size` a
 `extract_table()`/`extract_all()`: cada tabela é limitada às suas primeiras
-`sample_size` linhas, na mesma ordenação usada na extração completa (então o
-sample é sempre o "topo" da ordenação, não linhas aleatórias). O valor usado
-fica registrado tanto no relatório quanto no JSON da tabela em `config_dir`.
+`sample_size` linhas a partir do ponto de leitura (do início, em carga full,
+ou do checkpoint, em incremental), na mesma ordenação usada na extração
+completa — então o sample é sempre o "topo" da ordenação, não linhas
+aleatórias. O valor usado fica registrado tanto no relatório quanto no JSON
+da tabela em `config_dir`. Um sample não avança o checkpoint incremental além
+do que de fato leu, então rodar sem `sample_size` depois continua corretamente
+do mesmo ponto.
 
 ```python
 relatorio = extract_all(query, model, OUTPUT_DIR, sample_size=1_000)
 ```
+
+## Carga incremental (`load_mode`, `control_dir`)
+
+`extract_table()`/`extract_all()` aceitam `load_mode` ("incremental", default,
+ou "full") e `control_dir` (default `"control"`).
+
+- **incremental**: para cada tabela, salva um checkpoint com os últimos
+  valores das colunas de ordenação (em geral data de controle + id) em
+  `<control_dir>/<schema>/<tabela>/checkpoint.json`. Na próxima carga, retoma
+  exatamente dali (`WHERE (data, id) > (última_data, último_id)`), trazendo só
+  as linhas novas — sem checkpoint prévio, equivale a uma carga full. Como os
+  parquets são sempre acrescentados (nunca sobrescritos), o resultado final é
+  o acumulado de todas as cargas incrementais.
+- **full**: apaga os parquets já extraídos da tabela (`output_dir`) e o
+  checkpoint, e recomeça do zero — use quando quiser reconstruir a tabela
+  inteira em vez de só acrescentar o que é novo.
+
+```python
+# primeira carga (ou renovação completa de uma tabela)
+extract_all(query, model, OUTPUT_DIR, config_dir=CONFIG_DIR, control_dir=CONTROL_DIR, load_mode="full")
+
+# cargas seguintes: só o que mudou desde a última vez
+extract_all(query, model, OUTPUT_DIR, config_dir=CONFIG_DIR, control_dir=CONTROL_DIR)  # load_mode="incremental" é o default
+```
+
+> Dê um `control_dir` (e `output_dir`/`config_dir`) próprio para cada pipeline
+> lógico. O checkpoint é identificado só por schema+tabela dentro do
+> `control_dir` — reusar o mesmo `control_dir` para duas extrações
+> independentes da "mesma" tabela (ex.: um teste e a carga de produção) faz
+> uma pisar no checkpoint da outra.
+>
+> Se a ordenação de uma tabela mudar (colunas do schema mudaram desde o
+> checkpoint salvo), o checkpoint é ignorado com um aviso, e a tabela é lida
+> do zero nessa rodada.
+
+Para inspecionar ou resetar manualmente: `load_checkpoint(schema, tabela, control_dir=...)`
+e `clear_checkpoint(schema, tabela, control_dir=...)`.
 
 ## Regras de ordenação e particionamento
 

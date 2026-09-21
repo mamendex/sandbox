@@ -1,5 +1,6 @@
 """ETL simples para Redshift baseado em pandas: discover, extract, transform e validate."""
 
+from .checkpoint import clear_checkpoint, load_checkpoint
 from .discover import TableModel, discover, load_model, save_model
 from .extract import extract_all, extract_table, load_table_query, save_table_query
 from .transform import TableLoader
@@ -23,6 +24,8 @@ __all__ = [
     "extract_table",
     "save_table_query",
     "load_table_query",
+    "load_checkpoint",
+    "clear_checkpoint",
     "TableLoader",
     "count_loaded_rows",
     "check_row_counts",
