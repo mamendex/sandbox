@@ -6,6 +6,8 @@ Pensado para ser importado em notebooks Jupyter.
 Pré-requisito: uma função `query(sql) -> pandas.DataFrame` que execute a query
 contra o Redshift (ex.: um wrapper existente de conexão via `psycopg2`/`sqlalchemy`).
 
+Notebook de exemplo (JupyterHub): [`notebooks/exemplo_uso.ipynb`](../notebooks/exemplo_uso.ipynb).
+
 ## Uso em notebook
 
 ```python
