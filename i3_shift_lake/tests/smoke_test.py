@@ -310,16 +310,17 @@ def main() -> None:
         print(status_report.to_string())
         status_by_table = status_report.set_index("table_name")
         assert status_by_table.loc["accounts", "status"] == "ok"
-        assert status_by_table.loc["accounts", "diff"] == 0
+        assert status_by_table.loc["accounts", "pct"] == 100.0
         assert status_by_table.loc["accounts", "parquet_files"] > 0
         assert status_by_table.loc["custom_leads_c", "status"] == "ok"
+        assert status_by_table.loc["custom_leads_c", "pct"] == 100.0
         # empty_table tem 0 linhas no discover -> extract_all pula (tables_with_rows),
         # entao nunca foi extraida: cenario real de tabela conhecida mas ainda sem parquet.
         assert status_by_table.loc["empty_table", "status"] == "nao_extraida"
         assert status_by_table.loc["empty_table", "parquet_files"] == 0
         assert status_by_table.loc["empty_table", "rows_loaded"] == 0
-        assert pd.isna(status_by_table.loc["empty_table", "diff"])
-        print("load_status: ok / diffs corretos / tabela nao extraida sinalizada")
+        assert pd.isna(status_by_table.loc["empty_table", "pct"])
+        print("load_status: ok / percentuais corretos / tabela nao extraida sinalizada")
 
         print("\n=== validate: load_status sem discover salvo (config_dir vazio) ===")
         no_discover_dir = os.path.join(base_dir, "config_sem_discover")

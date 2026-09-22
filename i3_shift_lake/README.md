@@ -252,12 +252,15 @@ check_duplicates_all(model, OUTPUT_DIR, config_dir=CONFIG_DIR)
 - `load_status(output_dir, schema, config_dir)`: relatório da situação da
   carga, uma linha por tabela, com `parquet_files`, `rows_loaded`,
   `expected_rows` (contagem do último `discover()` salvo em `config_dir`,
-  se houver) e `diff`. Não precisa de um `TableModel` em mãos — lê
-  `output_dir` diretamente e carrega o modelo persistido sozinho. Tabelas
-  que o `discover` conhece mas que ainda não têm parquet aparecem com
+  se houver) e `pct` (`rows_loaded / expected_rows * 100`, arredondado em
+  1 casa). Não precisa de um `TableModel` em mãos — lê `output_dir`
+  diretamente e carrega o modelo persistido sozinho. Tabelas que o
+  `discover` conhece mas que ainda não têm parquet aparecem com
   `status="nao_extraida"` (0 arquivos/linhas); sem nenhum `discover` salvo
   em `config_dir`, o relatório ainda lista as tabelas extraídas, mas
-  `expected_rows`/`diff` ficam vazios (`status="sem_discover"`).
+  `expected_rows`/`pct` ficam vazios (`status="sem_discover"`). O `status`
+  em si continua sendo `"ok"`/`"divergente"` pela igualdade exata de linhas,
+  não pelo `pct` — o percentual é só informativo.
 - `count_loaded_rows(output_dir, schema, table)` / `check_row_counts(model, output_dir)`:
   conta linhas lendo só metadados do parquet (sem carregar os dados) e compara
   com a contagem levantada pelo `discover`. Diferente de `load_status`, exige
