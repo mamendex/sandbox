@@ -184,6 +184,34 @@ A coluna de particionamento dos parquets (`id` ou `id_c`, a que existir) é
 transformada em um bucket estável (`hash % num_buckets`) e gravada como
 partição `bucket=N` dentro de `OUTPUT_DIR/<schema>/<tabela>/`.
 
+## Colunas de data com valores nulos (`NULL_DATE_SENTINEL`)
+
+Uma coluna de data usada em `order_by` (`date_modified`/`date_created`) pode
+ter `NULL` em algumas — ou na maioria — das linhas (comum quando a coluna só é
+preenchida na primeira atualização de um registro; até lá fica nula). Um
+`NULL` ali é um problema real: `WHERE (data, id) > (NULL, x)` nunca é
+verdadeiro em SQL, então, se o checkpoint parar numa linha com data nula, a
+carga incremental fica travada em 0 linhas para sempre — mesmo que dados
+novos cheguem depois.
+
+Com `column_types` disponível (o caso normal, vindo do `discover()`), o
+`ORDER BY` e o filtro de retomada passam a usar
+`COALESCE("data", TIMESTAMP '1900-01-01')` no lugar da coluna crua — `NULL`
+nunca mais entra na comparação. O dado armazenado no parquet continua o
+real (`NULL` onde houver); só a ordenação/checkpoint internos usam o
+substituto. Como `1900-01-01` é a menor data possível, linhas com data nula
+passam a ordenar primeiro (tratadas como "as mais antigas") — se um desses
+registros for modificado de verdade depois, a nova data é maior que
+qualquer checkpoint já alcançado e ele é pego normalmente na carga
+incremental seguinte.
+
+O valor sentinela é `i3_shift_lake.NULL_DATE_SENTINEL` (`"1900-01-01"`).
+
+> Sem `column_types` (ex.: config salva por uma versão anterior do pacote),
+> o framework não sabe que a coluna é uma data e não aplica o `COALESCE` —
+> continua funcionando sem quebrar, mas com o risco de travar descrito
+> acima. Rode `discover()` de novo para atualizar o `config_dir`.
+
 ## Schema consistente entre páginas (`column_types`)
 
 Cada página é gravada como um arquivo parquet separado. Se uma coluna de texto

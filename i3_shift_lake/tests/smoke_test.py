@@ -32,7 +32,7 @@ from i3_shift_lake import (  # noqa: E402
     check_unique, check_foreign_key, run_checks,
     load_checkpoint,
 )
-from i3_shift_lake.extract import extract_table  # noqa: E402
+from i3_shift_lake.extract import extract_table, NULL_DATE_SENTINEL  # noqa: E402
 
 SCHEMA = "meu_schema"
 
@@ -76,12 +76,65 @@ for table, df in FAKE_TABLES.items():
 COLUMNS_DF = pd.DataFrame(COLUMNS_INFO)
 
 
-def _apply_resume_where(df: pd.DataFrame, cols: list[str], raw_values: list[str]) -> pd.DataFrame:
-    """Simula `WHERE (cols) > (values)` (comparação por tupla) para o teste do checkpoint."""
+def _split_top_level(s: str) -> list[str]:
+    """Divide por vírgula ignorando vírgulas dentro de parênteses (ex.: dentro de um
+    COALESCE(...)) — um `str.split(",")` simples quebraria nesse caso."""
+    parts = []
+    depth = 0
+    current = ""
+    for ch in s:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        parts.append(current.strip())
+    return parts
+
+
+def _extract_balanced_parens(s: str, open_idx: int) -> tuple[str, int]:
+    """`s[open_idx]` precisa ser '('. Devolve (conteúdo interno, índice logo após o ')')."""
+    depth = 0
+    for i in range(open_idx, len(s)):
+        if s[i] == "(":
+            depth += 1
+        elif s[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return s[open_idx + 1 : i], i + 1
+    raise ValueError(f"parenteses desbalanceados em: {s[open_idx:]}")
+
+
+def _parse_order_col_expr(expr: str) -> tuple[str, str | None]:
+    """`'"col"'` -> (col, None); `'COALESCE("col", TIMESTAMP \\'YYYY-MM-DD\\')'` -> (col, sentinela)."""
+    expr = expr.strip()
+    m = re.match(r"COALESCE\(\"([^\"]+)\",\s*TIMESTAMP\s*'([^']+)'\)", expr)
+    if m:
+        return m.group(1), m.group(2)
+    return expr.strip('"'), None
+
+
+def _effective_series(df: pd.DataFrame, col: str, sentinel: str | None) -> pd.Series:
+    series = df[col]
+    if sentinel is not None:
+        series = series.fillna(pd.Timestamp(sentinel))
+    return series
+
+
+def _apply_resume_where(df: pd.DataFrame, col_exprs: list[str], raw_values: list[str]) -> pd.DataFrame:
+    """Simula `WHERE (col_exprs) > (values)` (comparação por tupla) para o teste do
+    checkpoint — entende tanto colunas simples quanto `COALESCE(col, TIMESTAMP '...')`
+    (usado para colunas de data que podem ser nulas)."""
     mask = pd.Series(False, index=df.index)
     still_equal = pd.Series(True, index=df.index)
-    for col, raw in zip(cols, raw_values):
-        series = df[col]
+    for expr, raw in zip(col_exprs, raw_values):
+        col, sentinel = _parse_order_col_expr(expr)
+        series = _effective_series(df, col, sentinel)
         raw = raw.split("::")[0].strip()  # remove cast explicito, ex: '...'::timestamp
         if raw == "NULL":
             # comparacao com NULL nunca e verdadeira em SQL -> nada passa a partir daqui
@@ -111,18 +164,31 @@ def make_fake_query(tables: dict, columns_df: pd.DataFrame):
             return pd.DataFrame({"row_count": [len(tables[table])]})
 
         df = tables[table]
-        where_match = re.search(r"WHERE \(([^)]+)\) > \(([^)]+)\)", sql)
-        if where_match:
-            cols = [c.strip().strip('"') for c in where_match.group(1).split(",")]
-            raw_values = [v.strip() for v in where_match.group(2).split(",")]
-            df = _apply_resume_where(df, cols, raw_values)
+        where_idx = sql.find("WHERE (")
+        if where_idx != -1:
+            open_idx = sql.index("(", where_idx)
+            cols_str, after = _extract_balanced_parens(sql, open_idx)
+            rest = sql[after:]
+            gt_idx = rest.index(">")
+            open_idx2 = after + rest.index("(", gt_idx)
+            vals_str, _ = _extract_balanced_parens(sql, open_idx2)
+            col_exprs = _split_top_level(cols_str)
+            raw_values = _split_top_level(vals_str)
+            df = _apply_resume_where(df, col_exprs, raw_values)
 
         # query paginada: SELECT cols FROM "schema"."table" [WHERE ...] ORDER BY ... LIMIT n OFFSET m
         limit = int(sql.split("LIMIT")[1].split("OFFSET")[0].strip())
         offset = int(sql.split("OFFSET")[1].strip())
         order_by_part = sql.split("ORDER BY")[1].split("LIMIT")[0].strip()
-        order_cols = [c.strip().strip('"') for c in order_by_part.split(",")]
-        sorted_df = df.sort_values(order_cols, na_position="last")
+        order_specs = [_parse_order_col_expr(e) for e in _split_top_level(order_by_part)]
+
+        sort_df = df.copy()
+        sort_keys = []
+        for i, (col, sentinel) in enumerate(order_specs):
+            key = f"__sort_key_{i}"
+            sort_df[key] = _effective_series(df, col, sentinel)
+            sort_keys.append(key)
+        sorted_df = sort_df.sort_values(sort_keys, na_position="last").drop(columns=sort_keys)
         return sorted_df.iloc[offset : offset + limit].reset_index(drop=True)
 
     return query
@@ -374,10 +440,13 @@ def main() -> None:
         assert ckpt_accounts_full["last_values"][1] == 255
         print("checkpoint apos full:", ckpt_accounts_full)
 
-        print("\n=== checkpoint com valor nulo (ultima linha com date_modified=None) ===")
+        print("\n=== checkpoint com valor nulo, SEM column_types (fallback antigo) ===")
         # reproduz o bug real: 'column "none" does not exist' quando o checkpoint guarda
         # um None (data nula na ultima linha extraida) e o proximo WHERE por tupla embutia
-        # str(None) sem aspas na query.
+        # str(None) sem aspas na query. Sem column_types, o framework nao sabe que a coluna
+        # e uma data e nao consegue aplicar o COALESCE -- degrada para o comportamento
+        # anterior (nao quebra, mas o checkpoint fica em NULL e pode "travar" o incremental;
+        # ver o bloco seguinte, com column_types, para a correcao de verdade).
         null_tables = {
             "tabela_com_data_nula": pd.DataFrame(
                 {
@@ -429,6 +498,97 @@ def main() -> None:
         )
         assert stats_null_2["status"] == "ok"
         print("checkpoint com valor nulo: sem crash ao retomar (rows_read =", stats_null_2["rows_read"], ")")
+
+        print("\n=== checkpoint com valor nulo, COM column_types (correcao com COALESCE) ===")
+        # mesmo cenario, mas passando column_types -- agora o framework sabe que
+        # "date_modified" e uma data e aplica COALESCE(date_modified, NULL_DATE_SENTINEL)
+        # no ORDER BY e no filtro de retomada. NULL_DATE_SENTINEL e a menor data possivel,
+        # entao a linha com data nula (id=3) passa a ordenar PRIMEIRO (nao mais por ultimo);
+        # o checkpoint fica com a data real mais recente (id=2), nao com o sentinela --
+        # mas o importante e que NULL nunca mais entra na comparacao, sem aviso, sem crash.
+        null2_tables = {
+            "tabela_com_data_nula": pd.DataFrame(
+                {
+                    "id": [1, 2, 3],
+                    "date_modified": [pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02"), None],
+                }
+            )
+        }
+        null2_query = make_fake_query(null2_tables, null_columns_df)
+        column_types_null2 = {"id": "integer", "date_modified": "timestamp without time zone"}
+
+        null2_output_dir = f"{base_dir}/out_null2"
+        null2_config_dir = f"{base_dir}/config_null2"
+        null2_control_dir = f"{base_dir}/control_null2"
+
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            stats_null2 = extract_table(
+                null2_query, SCHEMA, "tabela_com_data_nula", ["id", "date_modified"],
+                null2_output_dir, page_size=10, config_dir=null2_config_dir, control_dir=null2_control_dir,
+                column_types=column_types_null2,
+            )
+        printed2 = buf2.getvalue()
+        print(printed2)
+        assert "AVISO" not in printed2, "com column_types, o COALESCE deveria evitar o aviso de valor nulo"
+        assert stats_null2["rows_read"] == 3
+        assert stats_null2["stopped_at"]["date_modified"] == pd.Timestamp("2024-01-02")
+        assert stats_null2["stopped_at"]["id"] == 2
+
+        # chega uma atualizacao de verdade no registro que tinha data nula (id=3):
+        # agora tem date_modified real, mais recente que o checkpoint atual (id=2, 2024-01-02)
+        null2_tables["tabela_com_data_nula"].loc[
+            null2_tables["tabela_com_data_nula"]["id"] == 3, "date_modified"
+        ] = pd.Timestamp("2024-03-01")
+
+        stats_null2_b = extract_table(
+            null2_query, SCHEMA, "tabela_com_data_nula", ["id", "date_modified"],
+            null2_output_dir, page_size=10, config_dir=null2_config_dir, control_dir=null2_control_dir,
+            column_types=column_types_null2,
+        )
+        assert stats_null2_b["rows_read"] == 1, (
+            "a atualizacao real do id=3 (que antes tinha data nula) deveria ser pega no incremental"
+        )
+        print(
+            "checkpoint com valor nulo (com column_types): sem aviso, sem travar, e a "
+            "atualizacao real do id=3 foi capturada no incremental seguinte"
+        )
+
+        # caso extremo: TODAS as linhas tem date_modified nula (o cenario real relatado,
+        # onde a absoluta maioria da tabela nunca foi modificada) -- aqui sim o checkpoint
+        # deve terminar gravado no sentinela, sem crash e sem NULL no JSON.
+        allnull_tables = {
+            "tabela_toda_nula": pd.DataFrame({"id": [1, 2, 3], "date_modified": [None, None, None]})
+        }
+        allnull_columns_df = pd.DataFrame(
+            [
+                {"table_name": "tabela_toda_nula", "column_name": "id", "data_type": "integer", "ordinal_position": 1},
+                {
+                    "table_name": "tabela_toda_nula", "column_name": "date_modified",
+                    "data_type": "timestamp without time zone", "ordinal_position": 2,
+                },
+            ]
+        )
+        allnull_query = make_fake_query(allnull_tables, allnull_columns_df)
+        allnull_output_dir = f"{base_dir}/out_allnull"
+        allnull_config_dir = f"{base_dir}/config_allnull"
+        allnull_control_dir = f"{base_dir}/control_allnull"
+
+        stats_allnull = extract_table(
+            allnull_query, SCHEMA, "tabela_toda_nula", ["id", "date_modified"],
+            allnull_output_dir, page_size=10, config_dir=allnull_config_dir, control_dir=allnull_control_dir,
+            column_types=column_types_null2,
+        )
+        assert stats_allnull["rows_read"] == 3
+        assert stats_allnull["stopped_at"]["date_modified"] == pd.Timestamp(NULL_DATE_SENTINEL)
+
+        ckpt_allnull_path = os.path.join(allnull_control_dir, SCHEMA, "tabela_toda_nula", "checkpoint.json")
+        with open(ckpt_allnull_path) as f:
+            ckpt_allnull_raw = json.load(f)
+        assert ckpt_allnull_raw["last_values"][0] == f"{NULL_DATE_SENTINEL}T00:00:00", (
+            "com todas as datas nulas, o checkpoint deve guardar o sentinela, nao null"
+        )
+        print(f"tabela 100% nula: checkpoint gravado no sentinela ({NULL_DATE_SENTINEL}), sem crash")
 
         print(
             "\n=== garantia da carga incremental: sem gaps, sem overlap de versao igual, "

@@ -22,6 +22,12 @@ _ORDER_PRIORITY = [
     ("date_created", "id_c"),
 ]
 
+# Sentinela para colunas de data usadas em order_by que podem vir NULL (ex.: date_modified
+# nunca preenchido nos registros que nunca foram atualizados). Um NULL ali travaria a carga
+# incremental para sempre — `WHERE (data, id) > (NULL, x)` nunca é verdadeiro em SQL — então
+# tratamos NULL como essa data (bem no passado, antes de qualquer dado real).
+NULL_DATE_SENTINEL = "1900-01-01"
+
 # Mapeia o data_type do Redshift (information_schema.columns) para um dtype pandas.
 # Aplicado em toda página antes de gravar, para fixar o schema de cada coluna e
 # evitar que uma página com uma coluna inteiramente nula (ex.: texto opcional só
@@ -105,11 +111,34 @@ def _format_literal(value, redshift_type: str | None) -> str:
     return str(value)
 
 
+def _order_by_expr(col: str, column_types: dict[str, str]) -> str:
+    """Expressão SQL de uma coluna de `order_by`. Colunas de data usam `COALESCE` com
+    `NULL_DATE_SENTINEL` para nunca deixar `NULL` entrar na ordenação/comparação de retomada
+    — o dado armazenado continua o real (com `NULL` onde houver); só a ordenação interna usa
+    o substituto."""
+    redshift_type = column_types.get(col)
+    target = _target_dtype(redshift_type) if redshift_type else None
+    if target == "datetime64[ns]":
+        return f"COALESCE(\"{col}\", TIMESTAMP '{NULL_DATE_SENTINEL}')"
+    return f'"{col}"'
+
+
+def _coalesce_checkpoint_value(value, col: str, column_types: dict[str, str]):
+    """Substitui um valor nulo de coluna de data pelo mesmo `NULL_DATE_SENTINEL` usado na
+    query, antes de salvar no checkpoint — senão o checkpoint guardaria `NULL` e a próxima
+    comparação `> NULL` nunca seria verdadeira, travando a carga incremental."""
+    redshift_type = column_types.get(col)
+    target = _target_dtype(redshift_type) if redshift_type else None
+    if target == "datetime64[ns]" and pd.isna(value):
+        return pd.Timestamp(NULL_DATE_SENTINEL)
+    return value
+
+
 def build_resume_filter(order_by: list[str], last_values: list, column_types: dict[str, str]) -> str:
     """Monta o `WHERE (colunas) > (valores)` para retomar de um checkpoint (comparação por tupla:
     continua exatamente depois da última linha extraída, sem pular nem duplicar linhas com o
     mesmo valor de data quando a ordenação é data+id)."""
-    cols_sql = ", ".join(f'"{c}"' for c in order_by)
+    cols_sql = ", ".join(_order_by_expr(c, column_types) for c in order_by)
     literals_sql = ", ".join(_format_literal(v, column_types.get(c)) for c, v in zip(order_by, last_values))
     return f"({cols_sql}) > ({literals_sql})"
 
@@ -132,15 +161,25 @@ def resolve_key(columns: list[str]) -> tuple[list[str], str]:
 
 
 def build_query_template(
-    schema: str, table: str, columns: list[str], order_by: list[str], where: str | None = None
+    schema: str,
+    table: str,
+    columns: list[str],
+    order_by: list[str],
+    column_types: dict[str, str] | None = None,
+    where: str | None = None,
 ) -> str:
     """Monta a query de select da tabela, com placeholders `{page_size}`/`{offset}` para paginação.
+
+    `column_types` faz colunas de data em `order_by` usarem `COALESCE(..., NULL_DATE_SENTINEL)`
+    no `ORDER BY` (ver `_order_by_expr`) — sem isso, linhas com data nula ficam soltas na
+    ordenação e, se a extração parar bem nelas, travam a carga incremental.
 
     `where`, quando informado (ver `build_resume_filter`), filtra a partir de um checkpoint
     para retomar uma carga incremental.
     """
+    column_types = column_types or {}
     cols_sql = ", ".join(f'"{c}"' for c in columns)
-    order_sql = ", ".join(f'"{c}"' for c in order_by)
+    order_sql = ", ".join(_order_by_expr(c, column_types) for c in order_by)
     where_sql = f"WHERE {where} " if where else ""
     return (
         f'SELECT {cols_sql} FROM "{schema}"."{table}" '
@@ -282,7 +321,7 @@ def extract_table(
             )
 
     where = build_resume_filter(order_by, resume_from, column_types) if resume_from else None
-    query_template = build_query_template(schema, table, columns, order_by, where)
+    query_template = build_query_template(schema, table, columns, order_by, column_types, where)
     save_table_query(
         schema, table, columns, order_by, partition_col, query_template,
         config_dir, sample_size, load_mode, resume_from,
@@ -326,8 +365,10 @@ def extract_table(
             break  # ultima pagina (menos linhas do que pedido)
 
     if last_row is not None:
-        # a carga avancou nesta rodada -> checkpoint novo (o ponto onde parou agora)
-        stopped_at = {c: last_row[c] for c in order_by}
+        # a carga avancou nesta rodada -> checkpoint novo (o ponto onde parou agora).
+        # valores nulos de coluna de data usam o mesmo NULL_DATE_SENTINEL do ORDER BY/WHERE
+        # (ver _coalesce_checkpoint_value) -- nunca salvamos NULL de verdade no checkpoint.
+        stopped_at = {c: _coalesce_checkpoint_value(last_row[c], c, column_types) for c in order_by}
         if any(pd.isna(v) for v in stopped_at.values()):
             print(
                 f"[extract_table] AVISO: {schema}.{table} parou com valor nulo em "
@@ -336,7 +377,7 @@ def extract_table(
                 f"(confira se essa coluna de ordenação pode mesmo ser nula na fonte)",
                 flush=True,
             )
-        save_checkpoint(schema, table, order_by, [last_row[c] for c in order_by], control_dir)
+        save_checkpoint(schema, table, order_by, [stopped_at[c] for c in order_by], control_dir)
     elif resume_from is not None:
         # nenhuma linha nova nesta rodada -> segue parado onde estava antes
         stopped_at = dict(zip(order_by, resume_from))

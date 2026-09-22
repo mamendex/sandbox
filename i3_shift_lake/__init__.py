@@ -6,7 +6,7 @@ contrato `QueryFn` — ver `i3_shift_lake.query`.
 
 from i3_shift_lake.checkpoint import clear_checkpoint, load_checkpoint
 from i3_shift_lake.discover import TableModel, discover, load_model, save_model
-from i3_shift_lake.extract import extract_all, extract_table, load_table_query, save_table_query
+from i3_shift_lake.extract import NULL_DATE_SENTINEL, extract_all, extract_table, load_table_query, save_table_query
 from i3_shift_lake.query import QueryFn, ping
 from i3_shift_lake.transform import TableLoader
 from i3_shift_lake.validate import (
@@ -29,6 +29,7 @@ __all__ = [
     "load_model",
     "extract_all",
     "extract_table",
+    "NULL_DATE_SENTINEL",
     "save_table_query",
     "load_table_query",
     "load_checkpoint",
