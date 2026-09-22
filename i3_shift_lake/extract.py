@@ -10,9 +10,9 @@ import time
 
 import pandas as pd
 
-from .checkpoint import DEFAULT_CONTROL_DIR, clear_checkpoint, load_checkpoint, save_checkpoint
-from .discover import DEFAULT_CONFIG_DIR, TableModel
-from .query import QueryFn
+from i3_shift_lake.checkpoint import DEFAULT_CONTROL_DIR, clear_checkpoint, load_checkpoint, save_checkpoint
+from i3_shift_lake.discover import DEFAULT_CONFIG_DIR, TableModel
+from i3_shift_lake.query import QueryFn
 
 # Ordem de prioridade (coluna de data, coluna de id) usada para ORDER BY e paginação.
 _ORDER_PRIORITY = [

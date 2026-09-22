@@ -4,12 +4,12 @@ Fala com qualquer fonte SQL (Redshift, DuckDB, Postgres, ...) através do
 contrato `QueryFn` — ver `i3_shift_lake.query`.
 """
 
-from .checkpoint import clear_checkpoint, load_checkpoint
-from .discover import TableModel, discover, load_model, save_model
-from .extract import extract_all, extract_table, load_table_query, save_table_query
-from .query import QueryFn, ping
-from .transform import TableLoader
-from .validate import (
+from i3_shift_lake.checkpoint import clear_checkpoint, load_checkpoint
+from i3_shift_lake.discover import TableModel, discover, load_model, save_model
+from i3_shift_lake.extract import extract_all, extract_table, load_table_query, save_table_query
+from i3_shift_lake.query import QueryFn, ping
+from i3_shift_lake.transform import TableLoader
+from i3_shift_lake.validate import (
     CheckResult,
     check_duplicate_ids,
     check_duplicates_all,

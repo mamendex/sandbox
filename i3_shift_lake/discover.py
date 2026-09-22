@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from .query import QueryFn
+from i3_shift_lake.query import QueryFn
 
 DEFAULT_CONFIG_DIR = "config"
 

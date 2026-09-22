@@ -16,8 +16,8 @@ from typing import Callable
 import pandas as pd
 import pyarrow.dataset as ds
 
-from .discover import TableModel
-from .extract import DEFAULT_CONFIG_DIR, load_table_query
+from i3_shift_lake.discover import TableModel
+from i3_shift_lake.extract import DEFAULT_CONFIG_DIR, load_table_query
 
 
 def _table_path(output_dir: str, schema: str, table: str) -> str:
