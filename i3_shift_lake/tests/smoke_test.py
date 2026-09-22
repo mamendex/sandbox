@@ -23,6 +23,7 @@ from contextlib import redirect_stdout
 from functools import partial
 
 import pandas as pd
+import pyarrow.dataset as ds
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
@@ -30,9 +31,9 @@ from i3_shift_lake import (  # noqa: E402
     ping, discover, extract_all, load_model, load_table_query, TableLoader,
     check_row_counts, check_duplicate_ids, check_duplicates_all, load_status,
     check_unique, check_foreign_key, run_checks,
-    load_checkpoint,
+    load_checkpoint, compact_table,
 )
-from i3_shift_lake.extract import extract_table, NULL_DATE_SENTINEL  # noqa: E402
+from i3_shift_lake.extract import extract_table, NULL_DATE_SENTINEL, bucket_for  # noqa: E402
 
 SCHEMA = "meu_schema"
 
@@ -700,9 +701,12 @@ def main() -> None:
         )
 
         # simula um overlap real (ex.: bug de paginacao): grava manualmente a MESMA linha
-        # (mesmo id, mesma data_modified) de novo no parquet, sem passar pelo extract
+        # (mesmo id, mesma data_modified) de novo no parquet, sem passar pelo extract.
+        # usa bucket_for de verdade (nao um valor fixo): uma escrita real do _write_page
+        # sempre cai no mesmo bucket pro mesmo id, e compact_table conta com essa invariante
+        # (dedupe e feito por bucket) — um overlap de paginacao de verdade nunca atravessa buckets.
         overlap_row = df_v1[df_v1["id"] == 1].copy()  # id=1 nunca foi modificado
-        overlap_row["bucket"] = 0
+        overlap_row["bucket"] = bucket_for(1, 32)
         overlap_dir = os.path.join(versao_output_dir, SCHEMA, "eventos")
         overlap_row.to_parquet(overlap_dir, engine="pyarrow", partition_cols=["bucket"], index=False)
 
@@ -713,6 +717,64 @@ def main() -> None:
         df_apos_overlap = loader_versao["eventos"]
         assert df_apos_overlap.shape[0] == N, "TableLoader deve dedupar overlap real tambem"
         print("overlap real (mesma versao lida 2x) detectado por check_duplicate_ids e dedupado pelo TableLoader")
+
+        print("\n=== compact_table: junta arquivos por bucket, descarta linhas mortas ===")
+        eventos_dataset = ds.dataset(overlap_dir, format="parquet")
+        files_antes = len(eventos_dataset.files)
+        rows_cru_antes = eventos_dataset.count_rows()
+        assert rows_cru_antes == N + len(ids_modificados) + 1, (
+            "linhas cruas esperadas: N originais + versoes antigas dos modificados + 1 overlap manual"
+        )
+
+        # min_age_hours bem alto: nada e elegivel, nada muda
+        report_nada = compact_table(
+            versao_output_dir, SCHEMA, "eventos", config_dir=versao_config_dir, min_age_hours=100000,
+        )
+        assert report_nada.empty, "com min_age_hours absurdamente alto, nenhum arquivo deveria ser elegivel"
+        assert len(ds.dataset(overlap_dir, format="parquet").files) == files_antes
+        print("min_age_hours alto: nenhum arquivo recente foi tocado")
+
+        # dry_run=True: calcula e reporta, mas nao mexe em nada
+        report_dry = compact_table(
+            versao_output_dir, SCHEMA, "eventos", config_dir=versao_config_dir,
+            min_age_hours=0, dry_run=True,
+        )
+        assert not report_dry.empty, "com min_age_hours=0 e dados existentes, deveria haver o que compactar"
+        assert len(ds.dataset(overlap_dir, format="parquet").files) == files_antes, "dry_run nao pode alterar arquivos"
+        print(f"dry_run: {len(report_dry)} bucket(s) seriam compactados, nada foi alterado de fato")
+
+        # compactacao de verdade: junta arquivos e descarta versoes mortas (via dedupe)
+        report_real = compact_table(
+            versao_output_dir, SCHEMA, "eventos", config_dir=versao_config_dir, min_age_hours=0,
+        )
+        assert not report_real.empty
+
+        eventos_dataset_depois = ds.dataset(overlap_dir, format="parquet")
+        files_depois = len(eventos_dataset_depois.files)
+        rows_cru_depois = eventos_dataset_depois.count_rows()
+        assert files_depois < files_antes, "compactacao deveria reduzir o numero de arquivos"
+        assert rows_cru_depois == N, (
+            "com dedupe=True, a compactacao deveria descartar as versoes mortas e o overlap real, "
+            "sobrando so as N versoes vigentes"
+        )
+        print(f"compactacao: {files_antes} -> {files_depois} arquivos, {rows_cru_antes} -> {rows_cru_depois} linhas cruas")
+
+        # dados continuam corretos e identicos aos de antes da compactacao, do ponto de vista de quem le
+        df_pos_compact = TableLoader(versao_output_dir, schema=SCHEMA, config_dir=versao_config_dir)["eventos"]
+        pd.testing.assert_frame_equal(
+            df_pos_compact.sort_values("id").reset_index(drop=True),
+            df_apos_overlap.sort_values("id").reset_index(drop=True),
+        )
+        dup_check_pos_compact = check_duplicate_ids(versao_output_dir, SCHEMA, "eventos", config_dir=versao_config_dir)
+        assert dup_check_pos_compact.empty, "sem overlaps reais depois da compactacao (foram descartados)"
+        print("compactacao e transparente para quem le: mesmos dados de antes, sem overlap")
+
+        # idempotencia: rodar de novo nao tem mais nada pra ganhar
+        report_idempotente = compact_table(
+            versao_output_dir, SCHEMA, "eventos", config_dir=versao_config_dir, min_age_hours=0,
+        )
+        assert report_idempotente.empty, "sem arquivos novos desde a ultima compactacao, nao ha nada a fazer"
+        print("compactacao e idempotente: rodar de novo sem novas cargas nao muda nada")
 
         print("\nOK: smoke test passou")
     finally:

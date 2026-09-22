@@ -184,6 +184,49 @@ A coluna de particionamento dos parquets (`id` ou `id_c`, a que existir) é
 transformada em um bucket estável (`hash % num_buckets`) e gravada como
 partição `bucket=N` dentro de `OUTPUT_DIR/<schema>/<tabela>/`.
 
+## Arquivos acumulados por carga e compactação (`compact_table`)
+
+Cada carga (rodada de extração) grava um arquivo parquet novo por bucket
+tocado — nunca reescreve os arquivos já existentes. Isso é proposital:
+escrita barata e atômica (nunca precisa reler/regravar o dataset inteiro), e
+dá pra reverter uma carga problemática apagando só os arquivos daquela
+rodada específica. O custo é que o número de arquivos por bucket só cresce
+com o tempo — mesmo cargas incrementais pequenas tendem a tocar quase todos
+os buckets (o hash distribui os ids uniformemente), então o total de
+arquivos cresce com o **número de cargas**, não com o volume de dados novo.
+
+`compact_table(output_dir, schema, table, config_dir, min_age_hours=24, dedupe=True, dry_run=False)`
+junta, por bucket, os arquivos mais antigos que `min_age_hours` num único
+arquivo:
+
+```python
+from i3_shift_lake import compact_table
+
+# so espia o que aconteceria, sem mexer em nada
+compact_table(OUTPUT_DIR, SCHEMA, "accounts", config_dir=CONFIG_DIR, dry_run=True)
+
+# compacta de verdade: junta arquivos com mais de 24h (default) em cada bucket
+compact_table(OUTPUT_DIR, SCHEMA, "accounts", config_dir=CONFIG_DIR)
+```
+
+- Arquivos **mais novos** que `min_age_hours` nunca são lidos nem apagados —
+  de propósito, para preservar a janela de rollback de uma carga recente
+  (que é justamente quando essa capacidade mais importa).
+- Com `dedupe=True` (default), além de juntar fisicamente os arquivos
+  elegíveis, descarta linhas cuja versão (`order_by` + id) já foi
+  substituída por uma versão mais nova em qualquer arquivo do bucket
+  (antigo ou recente) — a mesma lógica que `TableLoader.load()` já aplica a
+  cada leitura, só que aqui o resultado fica gravado em disco de vez,
+  reduzindo também o volume de dados morto (versões antigas de ids
+  modificados, overlaps reais de paginação). Requer a config persistida da
+  tabela; sem ela, cai para `dedupe=False` com aviso.
+- Devolve um relatório (`bucket`, `files_before`/`files_after`,
+  `rows_before`/`rows_after`) com uma linha por bucket efetivamente
+  compactado — buckets sem nada a ganhar nem aparecem.
+- É transparente para quem lê os dados depois (`TableLoader`,
+  `check_duplicate_ids` etc. continuam vendo exatamente os mesmos dados) e
+  idempotente (rodar de novo sem cargas novas não muda nada).
+
 ## Colunas de data com valores nulos (`NULL_DATE_SENTINEL`)
 
 Uma coluna de data usada em `order_by` (`date_modified`/`date_created`) pode

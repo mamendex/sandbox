@@ -5,6 +5,7 @@ contrato `QueryFn` — ver `i3_shift_lake.query`.
 """
 
 from i3_shift_lake.checkpoint import clear_checkpoint, load_checkpoint
+from i3_shift_lake.compact import compact_table
 from i3_shift_lake.discover import TableModel, discover, load_model, save_model
 from i3_shift_lake.extract import NULL_DATE_SENTINEL, extract_all, extract_table, load_table_query, save_table_query
 from i3_shift_lake.query import QueryFn, ping
@@ -35,6 +36,7 @@ __all__ = [
     "load_table_query",
     "load_checkpoint",
     "clear_checkpoint",
+    "compact_table",
     "TableLoader",
     "count_loaded_rows",
     "load_status",
