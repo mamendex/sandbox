@@ -106,8 +106,10 @@ ou "full") e `control_dir` (default `"control"`).
 O relatório de `extract_all()`/`extract_table()` traz a coluna `stopped_at`
 com os valores de `order_by` onde a carga parou (ex.: `{"date_modified":
 "2024-06-01 12:00:00", "id": 4821}`) — é esse ponto que fica salvo no
-checkpoint e de onde a próxima carga incremental retoma. O mesmo aparece nos
-prints de progresso, página a página, durante a extração.
+checkpoint e de onde a próxima carga incremental retoma. Nos prints de
+progresso, página a página, o mesmo ponto aparece de forma compacta, sem
+nomes de coluna e datas em `YYYYMMDDHHMMSS`, para caber numa linha só:
+`posicao {'20240601120000,4821'}`.
 
 ```python
 # primeira carga (ou renovação completa de uma tabela)

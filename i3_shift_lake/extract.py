@@ -209,6 +209,22 @@ def _write_page(df: pd.DataFrame, table_dir: str, partition_col: str, num_bucket
     df.to_parquet(table_dir, engine="pyarrow", partition_cols=["bucket"], index=False)
 
 
+def _format_position(values) -> str:
+    """Formata os valores de `order_by` (dict ou lista) de forma compacta para log:
+    datas viram `YYYYMMDDHHMMSS`, o resto vira `str(valor)`, sem nomes de coluna —
+    só para caber numa linha de progresso; o relatório continua com o dict completo."""
+    items = values.values() if isinstance(values, dict) else values
+    parts = []
+    for v in items:
+        if pd.isna(v):
+            parts.append("None")
+        elif hasattr(v, "strftime"):
+            parts.append(v.strftime("%Y%m%d%H%M%S"))
+        else:
+            parts.append(str(v))
+    return "{'" + ",".join(parts) + "'}"
+
+
 def extract_table(
     query: QueryFn,
     schema: str,
@@ -277,7 +293,7 @@ def extract_table(
     start = time.perf_counter()
     print(
         f"[extract_table] iniciando {schema}.{table} (load_mode={load_mode}"
-        + (f", retomando de {resume_from}" if resume_from else "")
+        + (f", retomando {_format_position(resume_from)}" if resume_from else "")
         + (f", sample_size={sample_size}" if sample_size is not None else "")
         + ")",
         flush=True,
@@ -300,11 +316,10 @@ def extract_table(
         pages += 1
         offset += len(page_df)
         last_row = page_df.iloc[-1]
-        posicao_atual = {c: last_row[c] for c in order_by}
+        posicao_atual = _format_position(last_row[c] for c in order_by)
         print(
-            f"[extract_table] {schema}.{table}: pagina {pages} lida, "
-            f"{rows_read} linhas ate agora, posicao atual {posicao_atual} "
-            f"({time.perf_counter() - start:.1f}s)",
+            f"[extract_table] {schema}.{table}: pag {pages}, {rows_read} linhas, "
+            f"posicao {posicao_atual} ({time.perf_counter() - start:.1f}s)",
             flush=True,
         )
         if len(page_df) < current_page_size:
@@ -316,9 +331,9 @@ def extract_table(
         if any(pd.isna(v) for v in stopped_at.values()):
             print(
                 f"[extract_table] AVISO: {schema}.{table} parou com valor nulo em "
-                f"{stopped_at}. Comparação com NULL nunca é verdadeira em SQL — a próxima "
-                f"carga incremental pode não trazer nenhuma linha nova a partir daqui. "
-                f"Confira se essa coluna de ordenação pode mesmo ser nula na fonte.",
+                f"{_format_position(stopped_at)} — comparação com NULL nunca é verdadeira em SQL, "
+                f"a próxima carga incremental pode não trazer linha nova a partir daqui "
+                f"(confira se essa coluna de ordenação pode mesmo ser nula na fonte)",
                 flush=True,
             )
         save_checkpoint(schema, table, order_by, [last_row[c] for c in order_by], control_dir)
@@ -329,8 +344,9 @@ def extract_table(
         stopped_at = None
 
     print(
-        f"[extract_table] {schema}.{table} concluida: {rows_read} linhas em {pages} paginas, "
-        f"parou em {stopped_at} ({time.perf_counter() - start:.1f}s)",
+        f"[extract_table] {schema}.{table}: concluida {rows_read} linhas, {pages} pag, "
+        f"parou {_format_position(stopped_at) if stopped_at else '-'} "
+        f"({time.perf_counter() - start:.1f}s)",
         flush=True,
     )
 
