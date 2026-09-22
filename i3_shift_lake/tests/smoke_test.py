@@ -1,12 +1,13 @@
-"""Smoke test do redshift_etl com um `query()` fake (sem precisar de Redshift real).
+"""Smoke test do i3_shift_lake com um `query()` fake (sem precisar de Redshift real).
 
-Roda: python redshift_etl/tests/smoke_test.py
-(ou `python -m redshift_etl.tests.smoke_test` a partir da raiz do repo)
+Roda: python i3_shift_lake/tests/smoke_test.py
+(ou `python -m i3_shift_lake.tests.smoke_test` a partir da raiz do repo)
 
-Cobre discover (+ persistência), o fluxo alternativo via load_model, extract
-paginado/particionado, sample_size, transform, validate (contagem/duplicidade/
-checks customizados) e a carga incremental/full com checkpoint — de ponta a
-ponta, em memória, em poucos segundos.
+Cobre ping (validação do contrato query()), discover (+ persistência), o
+fluxo alternativo via load_model, extract paginado/particionado, sample_size,
+transform, validate (contagem/duplicidade/checks customizados) e a carga
+incremental/full com checkpoint — de ponta a ponta, em memória, em poucos
+segundos.
 """
 
 from __future__ import annotations
@@ -23,8 +24,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-from redshift_etl import (  # noqa: E402
-    discover, extract_all, load_model, load_table_query, TableLoader,
+from i3_shift_lake import (  # noqa: E402
+    ping, discover, extract_all, load_model, load_table_query, TableLoader,
     check_row_counts, check_duplicate_ids, check_duplicates_all,
     check_unique, check_foreign_key, run_checks,
     load_checkpoint,
@@ -91,6 +92,8 @@ def _apply_resume_where(df: pd.DataFrame, cols: list[str], raw_values: list[str]
 
 
 def fake_query(sql: str) -> pd.DataFrame:
+    if sql.strip() == "SELECT 1 AS ok":
+        return pd.DataFrame({"ok": [1]})
     if "information_schema.columns" in sql:
         return COLUMNS_DF
     table = re.search(r'FROM "[^"]+"\."([^"]+)"', sql).group(1)
@@ -114,14 +117,18 @@ def fake_query(sql: str) -> pd.DataFrame:
 
 
 def main() -> None:
-    base_dir = tempfile.mkdtemp(prefix="redshift_etl_smoke_")
+    base_dir = tempfile.mkdtemp(prefix="i3_shift_lake_smoke_")
     print(f"diretorio temporario: {base_dir}")
     output_dir = f"{base_dir}/out"
     config_dir = f"{base_dir}/config"
     control_dir = f"{base_dir}/control"
 
     try:
-        print("=== discover (persiste config) ===")
+        print("=== ping (valida o contrato query()) ===")
+        assert ping(fake_query) is True
+        print("ping OK")
+
+        print("\n=== discover (persiste config) ===")
         model = discover(fake_query, SCHEMA, config_dir=config_dir)
         print("tables:", model.tables)
         print("row_counts:", model.row_counts)

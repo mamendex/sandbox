@@ -1,17 +1,38 @@
-# redshift_etl
+# i3_shift_lake
 
-ETL simples baseado em pandas para Redshift: discover -> extract -> transform -> validate.
-Pensado para ser importado em notebooks Jupyter.
+ETL simples baseado em pandas: discover -> extract -> transform -> validate.
+Pensado para ser importado em notebooks Jupyter. Feito para o Redshift, mas
+não depende dele — qualquer fonte que fale SQL padrão serve (ver `QueryFn`
+abaixo). Prova disso: [`../worldbank_lake`](../worldbank_lake/README.md), um
+segundo projeto que usa este pacote contra dados públicos via DuckDB.
 
-Pré-requisito: uma função `query(sql) -> pandas.DataFrame` que execute a query
-contra o Redshift (ex.: um wrapper existente de conexão via `psycopg2`/`sqlalchemy`).
+## Pré-requisito: `query(sql) -> pandas.DataFrame`
+
+O pacote não abre conexão sozinho. Você passa uma função (ou qualquer
+callable) que execute o SQL e devolva um `pandas.DataFrame`:
+
+```python
+def query(sql: str) -> pd.DataFrame:
+    return pd.read_sql(sql, minha_conexao)  # psycopg2, sqlalchemy, redshift_connector, duckdb, ...
+```
+
+Não precisa herdar nada nem importar nada para isso funcionar — `i3_shift_lake.query.QueryFn`
+é um `typing.Protocol` que só documenta e tipa essa assinatura (tipagem
+estrutural: uma função comum já satisfaz o contrato). Antes de rodar o
+pipeline inteiro, valide sua implementação com `ping()`:
+
+```python
+from i3_shift_lake import ping
+
+ping(query)  # roda um SELECT 1 e levanta TypeError com uma mensagem clara se algo não bater
+```
 
 Notebook de exemplo (JupyterHub): [`notebooks/exemplo_uso.ipynb`](../notebooks/exemplo_uso.ipynb).
 
 ## Uso em notebook
 
 ```python
-from redshift_etl import discover, load_model, extract_all, TableLoader
+from i3_shift_lake import discover, load_model, extract_all, TableLoader
 
 SCHEMA = "meu_schema"
 OUTPUT_DIR = "./dados_extraidos"
@@ -140,10 +161,10 @@ mapeados ou que falhem na conversão ficam como o pandas inferiu.
 > comportamento fica igual ao de antes dessa correção. Rode `discover()` de
 > novo para atualizar o `config_dir` com os tipos.
 
-## Validação da carga (`redshift_etl/validate.py`)
+## Validação da carga (`i3_shift_lake/validate.py`)
 
 ```python
-from redshift_etl import check_row_counts, check_duplicates_all, check_unique, check_foreign_key, run_checks
+from i3_shift_lake import check_row_counts, check_duplicates_all, check_unique, check_foreign_key, run_checks
 
 # linhas carregadas (parquet) x linhas esperadas (discover), por tabela
 check_row_counts(model, OUTPUT_DIR)
@@ -168,7 +189,7 @@ comuns; escreva sua própria função com a mesma assinatura (retornando um
 
 ```python
 from functools import partial
-from redshift_etl import check_unique, check_foreign_key, run_checks
+from i3_shift_lake import check_unique, check_foreign_key, run_checks
 
 df_clientes = loader.load("clientes")
 df_pedidos = loader.load("pedidos")

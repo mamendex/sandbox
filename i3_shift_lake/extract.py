@@ -1,4 +1,4 @@
-"""Extração paginada de tabelas do Redshift para parquet particionado por bucket."""
+"""Extração paginada de tabelas para parquet particionado por bucket."""
 
 from __future__ import annotations
 
@@ -7,14 +7,12 @@ import json
 import os
 import shutil
 import time
-from typing import Callable
 
 import pandas as pd
 
 from .checkpoint import DEFAULT_CONTROL_DIR, clear_checkpoint, load_checkpoint, save_checkpoint
 from .discover import DEFAULT_CONFIG_DIR, TableModel
-
-QueryFn = Callable[[str], pd.DataFrame]
+from .query import QueryFn
 
 # Ordem de prioridade (coluna de data, coluna de id) usada para ORDER BY e paginação.
 _ORDER_PRIORITY = [

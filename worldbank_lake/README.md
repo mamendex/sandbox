@@ -1,15 +1,15 @@
-# public_data_lake
+# worldbank_lake
 
-Segundo projeto de demonstração do `redshift_etl`: baixa uma base pública real
+Segundo projeto de demonstração do `i3_shift_lake`: baixa uma base pública real
 (Banco Mundial — população e PIB por país/ano, via
 [github.com/datasets](https://github.com/datasets), dados originais do
 [World Bank Open Data](https://data.worldbank.org/), CC-BY-4.0), materializa
-num [DuckDB](https://duckdb.org/) local e usa o `redshift_etl` (o mesmo
+num [DuckDB](https://duckdb.org/) local e usa o `i3_shift_lake` (o mesmo
 pacote usado para o Redshift) para descobrir o schema, extrair de forma
 paginada e particionada, e validar a carga — sem mudar uma linha do pacote.
 
 Funciona porque o DuckDB fala essencialmente o mesmo dialeto SQL que o
-`redshift_etl` já assume: `information_schema.columns`, identificadores entre
+`i3_shift_lake` já assume: `information_schema.columns`, identificadores entre
 aspas duplas, `LIMIT`/`OFFSET`, comparação por tupla no `WHERE`. Só trocamos
 a função `query(sql) -> pandas.DataFrame` que é passada para
 `discover`/`extract_all` — tudo o mais é o pacote de sempre.
@@ -22,9 +22,9 @@ Notebook de exemplo: [`notebooks/migrar_dataset_publico.ipynb`](notebooks/migrar
   versionado) e monta um DuckDB local (`warehouse.duckdb`, também gerado) com
   duas tabelas (`population`, `gdp`), cada uma com colunas `id` e
   `date_modified` adicionadas na ingestão (a fonte original não tem colunas
-  de controle — são necessárias para o `redshift_etl` ordenar/particionar/
+  de controle — são necessárias para o `i3_shift_lake` ordenar/particionar/
   retomar como faria numa tabela real do Redshift). Expõe `get_query_fn()`,
-  que devolve a função `query(sql)` a ser passada ao `redshift_etl`.
+  que devolve a função `query(sql)` a ser passada ao `i3_shift_lake`.
 - `notebooks/migrar_dataset_publico.ipynb`: discover → extract (paginado,
   particionado, incremental) → transform → validate, incluindo uma simulação
   de "chegada de dados novos" para mostrar a carga incremental de verdade
@@ -36,18 +36,18 @@ Notebook de exemplo: [`notebooks/migrar_dataset_publico.ipynb`](notebooks/migrar
 
 ```python
 import sys
-sys.path.insert(0, "..")  # raiz do repo, para importar redshift_etl
+sys.path.insert(0, "..")  # raiz do repo, para importar i3_shift_lake
 
-from public_data_lake.source import build_database, get_query_fn
-from redshift_etl import discover, extract_all, TableLoader
+from worldbank_lake.source import build_database, get_query_fn
+from i3_shift_lake import discover, extract_all, TableLoader
 
 build_database()  # baixa os CSVs (1a vez) e monta o DuckDB local
 query = get_query_fn()
 
-model = discover(query, "public_data", config_dir="./config")
+model = discover(query, "worldbank", config_dir="./config")
 extract_all(query, model, "./dados_extraidos", page_size=2000, num_buckets=8, control_dir="./control")
 
-loader = TableLoader("./dados_extraidos", schema="public_data")
+loader = TableLoader("./dados_extraidos", schema="worldbank")
 df_pop = loader["population"]
 ```
 

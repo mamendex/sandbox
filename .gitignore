@@ -1,9 +1,9 @@
 __pycache__/
 *.pyc
 
-# public_data_lake: dados baixados/gerados, não versionados
-public_data_lake/**/raw/
-public_data_lake/**/*.duckdb
-public_data_lake/**/config/
-public_data_lake/**/control/
-public_data_lake/**/dados_extraidos/
+# worldbank_lake: dados baixados/gerados, não versionados
+worldbank_lake/**/raw/
+worldbank_lake/**/*.duckdb
+worldbank_lake/**/config/
+worldbank_lake/**/control/
+worldbank_lake/**/dados_extraidos/

@@ -1,7 +1,7 @@
 """Baixa datasets públicos (Banco Mundial, via github.com/datasets) e materializa em um
-DuckDB local, que serve de fonte de dados para o redshift_etl através de `query(sql)`.
+DuckDB local, que serve de fonte de dados para o i3_shift_lake através de `query(sql)`.
 
-DuckDB fala o mesmo dialeto SQL que o redshift_etl já usa (information_schema.columns,
+DuckDB fala o mesmo dialeto SQL que o i3_shift_lake já usa (information_schema.columns,
 identificadores entre aspas duplas, LIMIT/OFFSET), então nenhum código do pacote precisa
 mudar — só trocamos o `query()` que é passado para `discover`/`extract_all`.
 """
@@ -16,7 +16,7 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW_DIR = os.path.join(HERE, "raw")
 DB_PATH = os.path.join(HERE, "warehouse.duckdb")
-SCHEMA = "public_data"
+SCHEMA = "worldbank"
 
 # Banco Mundial (World Bank Open Data, CC-BY-4.0), espelhado em CSV por github.com/datasets.
 SOURCES = {
@@ -42,7 +42,7 @@ def download_csv(name: str, url: str, force: bool = False) -> str:
 def build_database(force_download: bool = False, db_path: str = DB_PATH, year_cutoff: int | None = None) -> str:
     """(Re)cria o DuckDB local a partir dos CSVs públicos, com colunas `id`/`date_modified`
     (a fonte original não tem essas colunas de controle — são adicionadas aqui para o
-    redshift_etl poder ordenar/particionar/retomar como faria numa tabela do Redshift).
+    i3_shift_lake poder ordenar/particionar/retomar como faria numa tabela do Redshift).
 
     `year_cutoff`, se informado, carrega só os anos até esse valor — útil para simular uma
     carga inicial parcial e, depois, a chegada de dados novos com `append_new_years()`.
@@ -74,7 +74,7 @@ def build_database(force_download: bool = False, db_path: str = DB_PATH, year_cu
 def append_new_years(min_year: int, db_path: str = DB_PATH) -> dict[str, int]:
     """Simula a chegada de dados novos na fonte: insere as linhas de `raw/*.csv` com
     `Year >= min_year` que ainda não estão na tabela, com `date_modified` = agora (mais
-    recente que o restante) — para exercitar a carga incremental do redshift_etl."""
+    recente que o restante) — para exercitar a carga incremental do i3_shift_lake."""
     con = duckdb.connect(db_path)
     inserted = {}
     for name in SOURCES:

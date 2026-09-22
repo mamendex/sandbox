@@ -1,7 +1,8 @@
-"""Descoberta do modelo de um schema no Redshift (tabelas, colunas e contagem de linhas).
+"""Descoberta do modelo de um schema (tabelas, colunas e contagem de linhas).
 
-Assume a existência de uma função `query(sql) -> pandas.DataFrame` para falar com o
-Redshift (ver README do pacote).
+Fala com a fonte de dados através de uma função `query(sql) -> pandas.DataFrame`
+(ver contrato em `i3_shift_lake.query.QueryFn`) — Redshift, DuckDB ou qualquer
+fonte que fale SQL padrão.
 """
 
 from __future__ import annotations
@@ -10,11 +11,10 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Callable
 
 import pandas as pd
 
-QueryFn = Callable[[str], pd.DataFrame]
+from .query import QueryFn
 
 DEFAULT_CONFIG_DIR = "config"
 

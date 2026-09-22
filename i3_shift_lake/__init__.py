@@ -1,8 +1,13 @@
-"""ETL simples para Redshift baseado em pandas: discover, extract, transform e validate."""
+"""ETL simples baseado em pandas: discover, extract, transform e validate.
+
+Fala com qualquer fonte SQL (Redshift, DuckDB, Postgres, ...) através do
+contrato `QueryFn` — ver `i3_shift_lake.query`.
+"""
 
 from .checkpoint import clear_checkpoint, load_checkpoint
 from .discover import TableModel, discover, load_model, save_model
 from .extract import extract_all, extract_table, load_table_query, save_table_query
+from .query import QueryFn, ping
 from .transform import TableLoader
 from .validate import (
     CheckResult,
@@ -16,6 +21,8 @@ from .validate import (
 )
 
 __all__ = [
+    "QueryFn",
+    "ping",
     "TableModel",
     "discover",
     "save_model",
