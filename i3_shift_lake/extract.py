@@ -88,7 +88,13 @@ def _format_literal(value, redshift_type: str | None) -> str:
     Datas/timestamps levam um cast explícito (`::timestamp`) em vez de depender de cast
     implícito de string dentro da comparação por tupla — o Redshift aceita normalmente,
     e alguns motores (ex.: DuckDB) exigem o cast explícito nesse contexto.
+
+    Um valor nulo (None/NaN/NaT) vira o literal SQL `NULL` — nunca um `str(value)` sem
+    aspas (isso gerava `column "none" does not exist", pois um `None` bruto na query é
+    lido como um identificador, não como literal).
     """
+    if pd.isna(value):
+        return "NULL"
     target = _target_dtype(redshift_type) if redshift_type else None
     if target == "datetime64[ns]":
         escaped = str(value).replace("'", "''")
@@ -307,6 +313,14 @@ def extract_table(
     if last_row is not None:
         # a carga avancou nesta rodada -> checkpoint novo (o ponto onde parou agora)
         stopped_at = {c: last_row[c] for c in order_by}
+        if any(pd.isna(v) for v in stopped_at.values()):
+            print(
+                f"[extract_table] AVISO: {schema}.{table} parou com valor nulo em "
+                f"{stopped_at}. Comparação com NULL nunca é verdadeira em SQL — a próxima "
+                f"carga incremental pode não trazer nenhuma linha nova a partir daqui. "
+                f"Confira se essa coluna de ordenação pode mesmo ser nula na fonte.",
+                flush=True,
+            )
         save_checkpoint(schema, table, order_by, [last_row[c] for c in order_by], control_dir)
     elif resume_from is not None:
         # nenhuma linha nova nesta rodada -> segue parado onde estava antes

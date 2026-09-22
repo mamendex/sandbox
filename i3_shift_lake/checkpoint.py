@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 
+import pandas as pd
+
 DEFAULT_CONTROL_DIR = "control"
 
 
@@ -19,6 +21,11 @@ def checkpoint_path(schema: str, table: str, control_dir: str = DEFAULT_CONTROL_
 
 
 def _to_jsonable(value):
+    # checa nulo antes de tudo: NaT tem .isoformat() e devolveria a string "NaT" (que na
+    # volta seria tratada como um timestamp de verdade, gerando 'NaT'::timestamp na query
+    # de retomada e quebrando no banco) — precisa virar null (None) mesmo.
+    if pd.isna(value):
+        return None
     if hasattr(value, "isoformat"):
         return value.isoformat()
     if hasattr(value, "item"):  # escalar numpy (int64, float64, bool_, ...)

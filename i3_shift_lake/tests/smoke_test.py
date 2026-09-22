@@ -12,12 +12,14 @@ segundos.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from functools import partial
 
 import pandas as pd
@@ -30,6 +32,7 @@ from i3_shift_lake import (  # noqa: E402
     check_unique, check_foreign_key, run_checks,
     load_checkpoint,
 )
+from i3_shift_lake.extract import extract_table  # noqa: E402
 
 SCHEMA = "meu_schema"
 
@@ -80,6 +83,9 @@ def _apply_resume_where(df: pd.DataFrame, cols: list[str], raw_values: list[str]
     for col, raw in zip(cols, raw_values):
         series = df[col]
         raw = raw.split("::")[0].strip()  # remove cast explicito, ex: '...'::timestamp
+        if raw == "NULL":
+            # comparacao com NULL nunca e verdadeira em SQL -> nada passa a partir daqui
+            return df.iloc[0:0]
         if pd.api.types.is_datetime64_any_dtype(series):
             val = pd.Timestamp(raw.strip("'"))
         elif raw.startswith("'"):
@@ -356,6 +362,76 @@ def main() -> None:
         ckpt_accounts_full = load_checkpoint(SCHEMA, "accounts", control_dir=incr_control_dir)
         assert ckpt_accounts_full["last_values"][1] == 255
         print("checkpoint apos full:", ckpt_accounts_full)
+
+        print("\n=== checkpoint com valor nulo (ultima linha com date_modified=None) ===")
+        # reproduz o bug real: 'column "none" does not exist' quando o checkpoint guarda
+        # um None (data nula na ultima linha extraida) e o proximo WHERE por tupla embutia
+        # str(None) sem aspas na query.
+        null_tables = {
+            "tabela_com_data_nula": pd.DataFrame(
+                {
+                    "id": [1, 2, 3],
+                    "date_modified": [pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02"), None],
+                }
+            )
+        }
+        null_columns_df = pd.DataFrame(
+            [
+                {"table_name": "tabela_com_data_nula", "column_name": "id", "data_type": "integer", "ordinal_position": 1},
+                {
+                    "table_name": "tabela_com_data_nula", "column_name": "date_modified",
+                    "data_type": "timestamp without time zone", "ordinal_position": 2,
+                },
+            ]
+        )
+
+        def null_query(sql: str) -> pd.DataFrame:
+            if "information_schema.columns" in sql:
+                return null_columns_df
+            df = null_tables["tabela_com_data_nula"]
+            where_match = re.search(r"WHERE \(([^)]+)\) > \(([^)]+)\)", sql)
+            if where_match:
+                cols = [c.strip().strip('"') for c in where_match.group(1).split(",")]
+                raw_values = [v.strip() for v in where_match.group(2).split(",")]
+                df = _apply_resume_where(df, cols, raw_values)
+            limit = int(sql.split("LIMIT")[1].split("OFFSET")[0].strip())
+            offset = int(sql.split("OFFSET")[1].strip())
+            order_by_part = sql.split("ORDER BY")[1].split("LIMIT")[0].strip()
+            order_cols = [c.strip().strip('"') for c in order_by_part.split(",")]
+            sorted_df = df.sort_values(order_cols, na_position="last")
+            return sorted_df.iloc[offset : offset + limit].reset_index(drop=True)
+
+        null_output_dir = f"{base_dir}/out_null"
+        null_config_dir = f"{base_dir}/config_null"
+        null_control_dir = f"{base_dir}/control_null"
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            stats_null = extract_table(
+                null_query, SCHEMA, "tabela_com_data_nula", ["id", "date_modified"],
+                null_output_dir, page_size=10, config_dir=null_config_dir, control_dir=null_control_dir,
+            )
+        printed = buf.getvalue()
+        print(printed)
+        assert "AVISO" in printed and "valor nulo" in printed, "esperava o aviso de checkpoint com valor nulo"
+        assert stats_null["rows_read"] == 3
+        assert pd.isna(stats_null["stopped_at"]["date_modified"])
+
+        ckpt_null_path = os.path.join(null_control_dir, SCHEMA, "tabela_com_data_nula", "checkpoint.json")
+        with open(ckpt_null_path) as f:
+            ckpt_null_raw = json.load(f)
+        assert ckpt_null_raw["order_by"] == ["date_modified", "id"]
+        assert ckpt_null_raw["last_values"][0] is None, "checkpoint deveria guardar null, nao a string 'NaT'"
+
+        # rodar de novo (incremental, retomando do checkpoint com NULL) nao pode mais quebrar
+        # com 'column "none" does not exist' -- so pode nao trazer linha nenhuma (NULL nunca
+        # e "maior que" nada em SQL), o que e esperado e nao um crash.
+        stats_null_2 = extract_table(
+            null_query, SCHEMA, "tabela_com_data_nula", ["id", "date_modified"],
+            null_output_dir, page_size=10, config_dir=null_config_dir, control_dir=null_control_dir,
+        )
+        assert stats_null_2["status"] == "ok"
+        print("checkpoint com valor nulo: sem crash ao retomar (rows_read =", stats_null_2["rows_read"], ")")
 
         print("\nOK: smoke test passou")
     finally:
