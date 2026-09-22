@@ -64,28 +64,32 @@ def check_row_counts(model: TableModel, output_dir: str) -> pd.DataFrame:
 def check_duplicate_ids(
     output_dir: str, schema: str, table: str, config_dir: str = DEFAULT_CONFIG_DIR
 ) -> pd.DataFrame:
-    """Verifica duplicidade da chave de particionamento (id/id_c) nos parquets de uma tabela.
+    """Verifica overlaps reais nos parquets de uma tabela: a MESMA versão de um id
+    (mesmos valores de `order_by`, não só o id) lida mais de uma vez.
 
-    A coluna verificada é a mesma usada para particionar/ordenar na extração
-    (persistida em `<config_dir>/<schema>/<table>.json`). Retorna um DataFrame
-    com os valores duplicados e quantas vezes aparecem (vazio se não há duplicatas).
+    Um id aparecer mais de uma vez com valores DIFERENTES de `order_by` não é reportado
+    aqui — é o esperado quando o registro é modificado e reextraído numa carga
+    incremental (`TableLoader.load()` já resolve isso, mantendo só a versão mais
+    recente). Esta checagem foca no bug real: duas leituras da mesma linha exata,
+    geralmente por overlap de paginação.
     """
-    id_column = load_table_query(schema, table, config_dir)["partition_column"]
+    table_cfg = load_table_query(schema, table, config_dir)
+    id_column = table_cfg["partition_column"]
+    dedup_cols = list(dict.fromkeys(table_cfg["order_by"] + [id_column]))
 
     path = _table_path(output_dir, schema, table)
     if not os.path.isdir(path):
         raise FileNotFoundError(f"tabela '{table}' não encontrada em {path}")
 
     start = time.perf_counter()
-    print(f"[check_duplicate_ids] varrendo {schema}.{table} pela coluna '{id_column}'...", flush=True)
+    print(f"[check_duplicate_ids] varrendo {schema}.{table} pelas colunas {dedup_cols}...", flush=True)
 
-    ids = ds.dataset(path, format="parquet").to_table(columns=[id_column]).column(id_column).to_pandas()
-    counts = ids.value_counts()
-    duplicated = counts[counts > 1].reset_index()
-    duplicated.columns = [id_column, "occurrences"]
+    df = ds.dataset(path, format="parquet").to_table(columns=dedup_cols).to_pandas()
+    counts = df.groupby(dedup_cols, dropna=False).size().reset_index(name="occurrences")
+    duplicated = counts[counts["occurrences"] > 1].reset_index(drop=True)
 
     print(
-        f"[check_duplicate_ids] {schema}.{table}: {len(duplicated)} ids duplicados "
+        f"[check_duplicate_ids] {schema}.{table}: {len(duplicated)} overlap(s) real(is) "
         f"({time.perf_counter() - start:.1f}s)",
         flush=True,
     )

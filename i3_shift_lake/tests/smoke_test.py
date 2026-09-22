@@ -97,29 +97,38 @@ def _apply_resume_where(df: pd.DataFrame, cols: list[str], raw_values: list[str]
     return df[mask]
 
 
-def fake_query(sql: str) -> pd.DataFrame:
-    if sql.strip() == "SELECT 1 AS ok":
-        return pd.DataFrame({"ok": [1]})
-    if "information_schema.columns" in sql:
-        return COLUMNS_DF
-    table = re.search(r'FROM "[^"]+"\."([^"]+)"', sql).group(1)
-    if sql.strip().upper().startswith("SELECT COUNT(*)"):
-        return pd.DataFrame({"row_count": [len(FAKE_TABLES[table])]})
+def make_fake_query(tables: dict, columns_df: pd.DataFrame):
+    """Fábrica de `query()` fake sobre um dict de tabelas (mutável — mudanças em `tables`
+    após a criação já valem na próxima chamada, simulando dados novos/modificados)."""
 
-    df = FAKE_TABLES[table]
-    where_match = re.search(r"WHERE \(([^)]+)\) > \(([^)]+)\)", sql)
-    if where_match:
-        cols = [c.strip().strip('"') for c in where_match.group(1).split(",")]
-        raw_values = [v.strip() for v in where_match.group(2).split(",")]
-        df = _apply_resume_where(df, cols, raw_values)
+    def query(sql: str) -> pd.DataFrame:
+        if sql.strip() == "SELECT 1 AS ok":
+            return pd.DataFrame({"ok": [1]})
+        if "information_schema.columns" in sql:
+            return columns_df
+        table = re.search(r'FROM "[^"]+"\."([^"]+)"', sql).group(1)
+        if sql.strip().upper().startswith("SELECT COUNT(*)"):
+            return pd.DataFrame({"row_count": [len(tables[table])]})
 
-    # query paginada: SELECT cols FROM "schema"."table" [WHERE ...] ORDER BY ... LIMIT n OFFSET m
-    limit = int(sql.split("LIMIT")[1].split("OFFSET")[0].strip())
-    offset = int(sql.split("OFFSET")[1].strip())
-    order_by_part = sql.split("ORDER BY")[1].split("LIMIT")[0].strip()
-    order_cols = [c.strip().strip('"') for c in order_by_part.split(",")]
-    sorted_df = df.sort_values(order_cols)
-    return sorted_df.iloc[offset : offset + limit].reset_index(drop=True)
+        df = tables[table]
+        where_match = re.search(r"WHERE \(([^)]+)\) > \(([^)]+)\)", sql)
+        if where_match:
+            cols = [c.strip().strip('"') for c in where_match.group(1).split(",")]
+            raw_values = [v.strip() for v in where_match.group(2).split(",")]
+            df = _apply_resume_where(df, cols, raw_values)
+
+        # query paginada: SELECT cols FROM "schema"."table" [WHERE ...] ORDER BY ... LIMIT n OFFSET m
+        limit = int(sql.split("LIMIT")[1].split("OFFSET")[0].strip())
+        offset = int(sql.split("OFFSET")[1].strip())
+        order_by_part = sql.split("ORDER BY")[1].split("LIMIT")[0].strip()
+        order_cols = [c.strip().strip('"') for c in order_by_part.split(",")]
+        sorted_df = df.sort_values(order_cols, na_position="last")
+        return sorted_df.iloc[offset : offset + limit].reset_index(drop=True)
+
+    return query
+
+
+fake_query = make_fake_query(FAKE_TABLES, COLUMNS_DF)
 
 
 def main() -> None:
@@ -171,7 +180,7 @@ def main() -> None:
             assert "{page_size}" in cfg["select_query"] and "{offset}" in cfg["select_query"]
 
         print("\n=== transform: TableLoader ===")
-        loader = TableLoader(output_dir, schema=SCHEMA)
+        loader = TableLoader(output_dir, schema=SCHEMA, config_dir=config_dir)
         print("available_tables:", loader.available_tables())
 
         df_accounts = loader["accounts"]
@@ -213,7 +222,7 @@ def main() -> None:
         assert (sample_report["rows_read"] <= 10).all()
         assert (sample_report["sample_size"] == 10).all()
 
-        sample_loader = TableLoader(sample_output_dir, schema=SCHEMA)
+        sample_loader = TableLoader(sample_output_dir, schema=SCHEMA, config_dir=sample_config_dir)
         df_accounts_sample = sample_loader["accounts"]
         print("\naccounts (sample) shape:", df_accounts_sample.shape)
         assert df_accounts_sample.shape[0] == 10
@@ -257,7 +266,9 @@ def main() -> None:
         print("duplicata de id=1 detectada corretamente")
 
         print("\n=== validate: checks customizados (unique / fk) ===")
-        df_accounts_full = loader.load("accounts")  # agora tem a duplicata proposital
+        # dedupe=False: queremos ver a duplicata proposital crua aqui (por padrao o
+        # TableLoader ja a resolveria sozinho, como comprovado no bloco de garantias abaixo)
+        df_accounts_full = loader.load("accounts", dedupe=False)
         custom_checks = [
             partial(check_unique, df_accounts_full, "id", "accounts"),
             partial(check_unique, df_leads, "id_c", "custom_leads_c"),
@@ -331,7 +342,7 @@ def main() -> None:
         # stopped_at avancou para a ultima linha nova (id=255)
         assert r3.loc[r3["table_name"] == "accounts", "stopped_at"].iloc[0]["id"] == 255
 
-        incr_loader = TableLoader(incr_output_dir, schema=SCHEMA)
+        incr_loader = TableLoader(incr_output_dir, schema=SCHEMA, config_dir=incr_config_dir)
         df_accounts_incr = incr_loader["accounts"]
         df_leads_incr = incr_loader["custom_leads_c"]
         print("\naccounts acumulado:", df_accounts_incr.shape, "| custom_leads_c acumulado:", df_leads_incr.shape)
@@ -385,21 +396,7 @@ def main() -> None:
             ]
         )
 
-        def null_query(sql: str) -> pd.DataFrame:
-            if "information_schema.columns" in sql:
-                return null_columns_df
-            df = null_tables["tabela_com_data_nula"]
-            where_match = re.search(r"WHERE \(([^)]+)\) > \(([^)]+)\)", sql)
-            if where_match:
-                cols = [c.strip().strip('"') for c in where_match.group(1).split(",")]
-                raw_values = [v.strip() for v in where_match.group(2).split(",")]
-                df = _apply_resume_where(df, cols, raw_values)
-            limit = int(sql.split("LIMIT")[1].split("OFFSET")[0].strip())
-            offset = int(sql.split("OFFSET")[1].strip())
-            order_by_part = sql.split("ORDER BY")[1].split("LIMIT")[0].strip()
-            order_cols = [c.strip().strip('"') for c in order_by_part.split(",")]
-            sorted_df = df.sort_values(order_cols, na_position="last")
-            return sorted_df.iloc[offset : offset + limit].reset_index(drop=True)
+        null_query = make_fake_query(null_tables, null_columns_df)
 
         null_output_dir = f"{base_dir}/out_null"
         null_config_dir = f"{base_dir}/config_null"
@@ -432,6 +429,106 @@ def main() -> None:
         )
         assert stats_null_2["status"] == "ok"
         print("checkpoint com valor nulo: sem crash ao retomar (rows_read =", stats_null_2["rows_read"], ")")
+
+        print(
+            "\n=== garantia da carga incremental: sem gaps, sem overlap de versao igual, "
+            "substitui ao modificar ==="
+        )
+        N = 47  # nao divide "redondo" com page_size=7 -> forca varias paginas com sobra nas bordas
+        versao_tables = {
+            "eventos": pd.DataFrame(
+                {
+                    "id": range(1, N + 1),
+                    "valor": ["v1"] * N,
+                    "date_modified": pd.date_range("2023-01-01", periods=N, freq="h"),
+                }
+            )
+        }
+        versao_columns_df = pd.DataFrame(
+            [
+                {"table_name": "eventos", "column_name": "id", "data_type": "integer", "ordinal_position": 1},
+                {"table_name": "eventos", "column_name": "valor", "data_type": "character varying", "ordinal_position": 2},
+                {
+                    "table_name": "eventos", "column_name": "date_modified",
+                    "data_type": "timestamp without time zone", "ordinal_position": 3,
+                },
+            ]
+        )
+        versao_query = make_fake_query(versao_tables, versao_columns_df)
+
+        versao_output_dir = f"{base_dir}/out_versao"
+        versao_config_dir = f"{base_dir}/config_versao"
+        versao_control_dir = f"{base_dir}/control_versao"
+        versao_cols = ["id", "valor", "date_modified"]
+
+        def extrai_eventos():
+            return extract_table(
+                versao_query, SCHEMA, "eventos", versao_cols, versao_output_dir,
+                page_size=7, config_dir=versao_config_dir, control_dir=versao_control_dir,
+            )
+
+        # 1a carga: extrai tudo
+        r_v1 = extrai_eventos()
+        assert r_v1["rows_read"] == N
+
+        loader_versao = TableLoader(versao_output_dir, schema=SCHEMA, config_dir=versao_config_dir)
+        df_v1 = loader_versao["eventos"]
+        assert df_v1.shape[0] == N, "sem gaps: todas as N linhas devem estar presentes apos a 1a carga"
+        assert set(df_v1["id"]) == set(range(1, N + 1)), "sem gaps: nenhum id pode faltar"
+        assert (df_v1["valor"] == "v1").all()
+        print(f"1a carga: {N} linhas, sem gaps (ids 1..{N} todos presentes)")
+
+        # 2a carga sem mudancas na fonte: nao pode reler nada
+        r_v2 = extrai_eventos()
+        assert r_v2["rows_read"] == 0, "id nao modificado nao deveria ser lido de novo"
+        dup_check_v2 = check_duplicate_ids(versao_output_dir, SCHEMA, "eventos", config_dir=versao_config_dir)
+        assert dup_check_v2.empty, "nao deveria haver overlap real apos a 2a carga (nada foi relido)"
+        print("2a carga sem mudancas: 0 linhas relidas, sem overlap")
+
+        # modifica 3 registros existentes (mesmo id, novo valor, date_modified mais recente)
+        ids_modificados = [5, 20, 40]
+        nova_data = pd.Timestamp("2023-01-01") + pd.Timedelta(hours=N + 10)
+        tabela_eventos = versao_tables["eventos"]
+        for idx in ids_modificados:
+            tabela_eventos.loc[tabela_eventos["id"] == idx, "valor"] = "v2"
+            tabela_eventos.loc[tabela_eventos["id"] == idx, "date_modified"] = nova_data
+
+        # 3a carga: deve reler EXATAMENTE os ids modificados, nada mais
+        r_v3 = extrai_eventos()
+        assert r_v3["rows_read"] == len(ids_modificados), "deveria reler so os ids modificados"
+
+        # a releitura de um id modificado (versao diferente) NAO e um overlap
+        dup_check_v3 = check_duplicate_ids(versao_output_dir, SCHEMA, "eventos", config_dir=versao_config_dir)
+        assert dup_check_v3.empty, "reextrair um id modificado (versao diferente) nao e um overlap"
+
+        # TableLoader deve devolver so N linhas (nao N+3): a versao nova substitui a antiga
+        df_v3 = loader_versao["eventos"]
+        assert df_v3.shape[0] == N, "a versao antiga do id modificado nao pode continuar aparecendo"
+        assert set(df_v3["id"]) == set(range(1, N + 1))
+        for idx in ids_modificados:
+            valor_atual = df_v3.loc[df_v3["id"] == idx, "valor"].iloc[0]
+            assert valor_atual == "v2", f"id {idx} deveria estar na versao nova (v2), veio '{valor_atual}'"
+        nao_modificados = [i for i in range(1, N + 1) if i not in ids_modificados]
+        assert (df_v3.loc[df_v3["id"].isin(nao_modificados), "valor"] == "v1").all()
+        print(
+            f"3a carga: {len(ids_modificados)} ids modificados relidos e substituidos "
+            f"(sem overlap, sem gap, ainda {N} linhas no total)"
+        )
+
+        # simula um overlap real (ex.: bug de paginacao): grava manualmente a MESMA linha
+        # (mesmo id, mesma data_modified) de novo no parquet, sem passar pelo extract
+        overlap_row = df_v1[df_v1["id"] == 1].copy()  # id=1 nunca foi modificado
+        overlap_row["bucket"] = 0
+        overlap_dir = os.path.join(versao_output_dir, SCHEMA, "eventos")
+        overlap_row.to_parquet(overlap_dir, engine="pyarrow", partition_cols=["bucket"], index=False)
+
+        dup_check_overlap = check_duplicate_ids(versao_output_dir, SCHEMA, "eventos", config_dir=versao_config_dir)
+        assert not dup_check_overlap.empty, "overlap real (mesma linha lida 2x) deveria ser detectado"
+        assert dup_check_overlap.iloc[0]["id"] == 1
+
+        df_apos_overlap = loader_versao["eventos"]
+        assert df_apos_overlap.shape[0] == N, "TableLoader deve dedupar overlap real tambem"
+        print("overlap real (mesma versao lida 2x) detectado por check_duplicate_ids e dedupado pelo TableLoader")
 
         print("\nOK: smoke test passou")
     finally:

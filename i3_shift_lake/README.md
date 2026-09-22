@@ -52,7 +52,7 @@ relatorio = extract_all(query, model, OUTPUT_DIR, page_size=50_000, num_buckets=
 relatorio  # DataFrame com tabela, status, linhas lidas, ordenação usada, etc.
 
 # 3. transform: carregar qualquer tabela extraída como DataFrame pandas
-loader = TableLoader(OUTPUT_DIR, schema=SCHEMA)
+loader = TableLoader(OUTPUT_DIR, schema=SCHEMA, config_dir=CONFIG_DIR)
 df_contas = loader.load("accounts")
 df_contas = loader["accounts"]  # atalho equivalente
 ```
@@ -131,6 +131,43 @@ extract_all(query, model, OUTPUT_DIR, config_dir=CONFIG_DIR, control_dir=CONTROL
 
 Para inspecionar ou resetar manualmente: `load_checkpoint(schema, tabela, control_dir=...)`
 e `clear_checkpoint(schema, tabela, control_dir=...)`.
+
+## Sem gaps, sem overlap de versão igual, substitui ao modificar
+
+Cada página vira um arquivo parquet novo (nunca sobrescrito). Se um registro é
+modificado entre uma carga e outra (mesmo id, `date_modified`/`date_created`
+mais recente), o filtro `WHERE (data, id) > (checkpoint)` garante que ele seja
+lido de novo — e as duas versões (antiga e nova) acabam fisicamente presentes
+no dataset. As garantias do framework são:
+
+- **Sem gaps**: a comparação por tupla (`(data, id) > (última_data, último_id)`)
+  cobre exatamente a fronteira onde a carga anterior parou, sem pular linhas —
+  mesmo quando várias linhas têm a mesma data.
+- **Sem reler o que não mudou**: um id cujo `date_modified` não avançou não
+  volta a bater no filtro — não é lido de novo.
+- **A versão nova substitui a antiga**: `TableLoader.load()` (com
+  `dedupe=True`, o default) resolve isso na leitura, mantendo só a linha com o
+  maior valor de `order_by` por id — a versão antiga do mesmo id nunca aparece
+  junto. Use `dedupe=False` para ver todas as versões cruas, como estão no
+  parquet.
+- **Overlap de verdade (bug) é detectável**: `check_duplicate_ids()` foi
+  ajustado para não confundir uma releitura por modificação (que é esperada)
+  com um overlap real. Ele só acusa quando a *mesma versão* de um id (mesmos
+  valores de `order_by`, não só o id) aparece mais de uma vez — o que só
+  deveria acontecer por um bug de paginação, nunca pela carga incremental
+  normal.
+
+```python
+loader = TableLoader(OUTPUT_DIR, schema=SCHEMA, config_dir=CONFIG_DIR)
+df = loader["accounts"]  # já com a versão mais recente de cada id
+
+check_duplicate_ids(OUTPUT_DIR, SCHEMA, "accounts", config_dir=CONFIG_DIR)  # só overlaps reais
+```
+
+Essas três garantias (sem gap, sem releitura do que não mudou, substituição
+correta ao modificar) têm um teste de ponta a ponta dedicado em
+[`tests/smoke_test.py`](tests/smoke_test.py) — incluindo a simulação de um
+overlap real de propósito, para provar que ele é detectado e resolvido.
 
 ## Regras de ordenação e particionamento
 
