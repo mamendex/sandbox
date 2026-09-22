@@ -294,20 +294,29 @@ def extract_table(
         pages += 1
         offset += len(page_df)
         last_row = page_df.iloc[-1]
+        posicao_atual = {c: last_row[c] for c in order_by}
         print(
             f"[extract_table] {schema}.{table}: pagina {pages} lida, "
-            f"{rows_read} linhas ate agora ({time.perf_counter() - start:.1f}s)",
+            f"{rows_read} linhas ate agora, posicao atual {posicao_atual} "
+            f"({time.perf_counter() - start:.1f}s)",
             flush=True,
         )
         if len(page_df) < current_page_size:
             break  # ultima pagina (menos linhas do que pedido)
 
     if last_row is not None:
+        # a carga avancou nesta rodada -> checkpoint novo (o ponto onde parou agora)
+        stopped_at = {c: last_row[c] for c in order_by}
         save_checkpoint(schema, table, order_by, [last_row[c] for c in order_by], control_dir)
+    elif resume_from is not None:
+        # nenhuma linha nova nesta rodada -> segue parado onde estava antes
+        stopped_at = dict(zip(order_by, resume_from))
+    else:
+        stopped_at = None
 
     print(
-        f"[extract_table] {schema}.{table} concluida: {rows_read} linhas em {pages} paginas "
-        f"({time.perf_counter() - start:.1f}s)",
+        f"[extract_table] {schema}.{table} concluida: {rows_read} linhas em {pages} paginas, "
+        f"parou em {stopped_at} ({time.perf_counter() - start:.1f}s)",
         flush=True,
     )
 
@@ -320,6 +329,7 @@ def extract_table(
         "pages": pages,
         "order_by": ", ".join(order_by),
         "partition_column": partition_col,
+        "stopped_at": stopped_at,
         "output_path": table_dir,
     }
 
@@ -372,6 +382,7 @@ def extract_all(
                 "pages": 0,
                 "order_by": None,
                 "partition_column": None,
+                "stopped_at": None,
                 "output_path": None,
             }
         results.append(stats)
@@ -382,6 +393,6 @@ def extract_all(
         results,
         columns=[
             "table_name", "status", "rows_read", "load_mode", "sample_size",
-            "pages", "order_by", "partition_column", "output_path",
+            "pages", "order_by", "partition_column", "stopped_at", "output_path",
         ],
     )

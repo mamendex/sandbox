@@ -103,6 +103,12 @@ ou "full") e `control_dir` (default `"control"`).
   checkpoint, e recomeça do zero — use quando quiser reconstruir a tabela
   inteira em vez de só acrescentar o que é novo.
 
+O relatório de `extract_all()`/`extract_table()` traz a coluna `stopped_at`
+com os valores de `order_by` onde a carga parou (ex.: `{"date_modified":
+"2024-06-01 12:00:00", "id": 4821}`) — é esse ponto que fica salvo no
+checkpoint e de onde a próxima carga incremental retoma. O mesmo aparece nos
+prints de progresso, página a página, durante a extração.
+
 ```python
 # primeira carga (ou renovação completa de uma tabela)
 extract_all(query, model, OUTPUT_DIR, config_dir=CONFIG_DIR, control_dir=CONTROL_DIR, load_mode="full")

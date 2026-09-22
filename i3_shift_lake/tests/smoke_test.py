@@ -286,6 +286,10 @@ def main() -> None:
         assert ckpt_leads["order_by"] == ["id_c"]
         assert ckpt_leads["last_values"][0] == "lead-040"
 
+        stopped_at_accounts_r1 = r1.loc[r1["table_name"] == "accounts", "stopped_at"].iloc[0]
+        print("stopped_at (accounts, r1):", stopped_at_accounts_r1)
+        assert stopped_at_accounts_r1["id"] == 250
+
         print("\n=== carga incremental: 2a rodada sem dados novos (deve trazer 0 linhas) ===")
         r2 = extract_all(
             fake_query, model, incr_output_dir, page_size=30, num_buckets=4,
@@ -294,6 +298,8 @@ def main() -> None:
         print(r2.to_string())
         assert (r2["rows_read"] == 0).all()
         assert (r2["pages"] == 0).all()
+        # sem linha nova, stopped_at deve continuar no mesmo ponto da rodada anterior
+        assert r2.loc[r2["table_name"] == "accounts", "stopped_at"].iloc[0]["id"] == 250
 
         print("\n=== carga incremental: chegam dados novos, 3a rodada deve trazer so o incremento ===")
         novas_contas = pd.DataFrame(
@@ -316,6 +322,8 @@ def main() -> None:
         print(r3.to_string())
         assert r3.loc[r3["table_name"] == "accounts", "rows_read"].iloc[0] == 5
         assert r3.loc[r3["table_name"] == "custom_leads_c", "rows_read"].iloc[0] == 5
+        # stopped_at avancou para a ultima linha nova (id=255)
+        assert r3.loc[r3["table_name"] == "accounts", "stopped_at"].iloc[0]["id"] == 255
 
         incr_loader = TableLoader(incr_output_dir, schema=SCHEMA)
         df_accounts_incr = incr_loader["accounts"]
