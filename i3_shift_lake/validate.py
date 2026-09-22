@@ -16,8 +16,8 @@ from typing import Callable
 import pandas as pd
 import pyarrow.dataset as ds
 
-from i3_shift_lake.discover import TableModel
-from i3_shift_lake.extract import DEFAULT_CONFIG_DIR, load_table_query
+from i3_shift_lake.discover import DEFAULT_CONFIG_DIR, TableModel, load_model
+from i3_shift_lake.extract import load_table_query
 
 
 def _table_path(output_dir: str, schema: str, table: str) -> str:
@@ -59,6 +59,70 @@ def check_row_counts(model: TableModel, output_dir: str) -> pd.DataFrame:
 
     print(f"[check_row_counts] concluido em {time.perf_counter() - start:.1f}s", flush=True)
     return pd.DataFrame(rows)
+
+
+def load_status(output_dir: str, schema: str, config_dir: str = DEFAULT_CONFIG_DIR) -> pd.DataFrame:
+    """Relatório da situação da carga: para cada tabela, quantos arquivos parquet,
+    quantas linhas carregadas, e quantas linhas eram esperadas no último `discover()`
+    (se houver modelo salvo em `config_dir`).
+
+    Não precisa de um `TableModel` em mãos — lê `output_dir` diretamente e, se existir,
+    o modelo persistido por `discover()`/`save_model()` em `config_dir`. Tabelas que o
+    discover conhece mas que ainda não foram extraídas também aparecem (0 arquivos/linhas,
+    status `nao_extraida`); sem um discover salvo, `expected_rows`/`diff` ficam vazios.
+    """
+    schema_dir = os.path.join(output_dir, schema)
+    extracted_tables = (
+        sorted(name for name in os.listdir(schema_dir) if os.path.isdir(os.path.join(schema_dir, name)))
+        if os.path.isdir(schema_dir)
+        else []
+    )
+
+    try:
+        expected_by_table = load_model(schema, config_dir).row_counts
+    except FileNotFoundError:
+        expected_by_table = {}
+
+    all_tables = sorted(set(extracted_tables) | set(expected_by_table.keys()))
+    print(f"[load_status] verificando {len(all_tables)} tabelas do schema {schema}", flush=True)
+
+    rows = []
+    for table in all_tables:
+        table_path = _table_path(output_dir, schema, table)
+        if table in extracted_tables:
+            dataset = ds.dataset(table_path, format="parquet")
+            parquet_files = len(dataset.files)
+            rows_loaded = dataset.count_rows()
+        else:
+            parquet_files = 0
+            rows_loaded = 0
+
+        expected_rows = expected_by_table.get(table)
+        if table not in extracted_tables:
+            status = "nao_extraida"
+            diff = None
+        elif expected_rows is None:
+            status = "sem_discover"
+            diff = None
+        else:
+            diff = rows_loaded - expected_rows
+            status = "ok" if diff == 0 else "divergente"
+
+        rows.append(
+            {
+                "table_name": table,
+                "parquet_files": parquet_files,
+                "rows_loaded": rows_loaded,
+                "expected_rows": expected_rows,
+                "diff": diff,
+                "status": status,
+            }
+        )
+
+    return pd.DataFrame(
+        rows,
+        columns=["table_name", "parquet_files", "rows_loaded", "expected_rows", "diff", "status"],
+    )
 
 
 def check_duplicate_ids(

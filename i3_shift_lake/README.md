@@ -237,7 +237,10 @@ mapeados ou que falhem na conversão ficam como o pandas inferiu.
 ## Validação da carga (`i3_shift_lake/validate.py`)
 
 ```python
-from i3_shift_lake import check_row_counts, check_duplicates_all, check_unique, check_foreign_key, run_checks
+from i3_shift_lake import load_status, check_row_counts, check_duplicates_all, check_unique, check_foreign_key, run_checks
+
+# relatório rápido por tabela: sem precisar de um `model` em mãos
+load_status(OUTPUT_DIR, SCHEMA, config_dir=CONFIG_DIR)
 
 # linhas carregadas (parquet) x linhas esperadas (discover), por tabela
 check_row_counts(model, OUTPUT_DIR)
@@ -246,9 +249,20 @@ check_row_counts(model, OUTPUT_DIR)
 check_duplicates_all(model, OUTPUT_DIR, config_dir=CONFIG_DIR)
 ```
 
+- `load_status(output_dir, schema, config_dir)`: relatório da situação da
+  carga, uma linha por tabela, com `parquet_files`, `rows_loaded`,
+  `expected_rows` (contagem do último `discover()` salvo em `config_dir`,
+  se houver) e `diff`. Não precisa de um `TableModel` em mãos — lê
+  `output_dir` diretamente e carrega o modelo persistido sozinho. Tabelas
+  que o `discover` conhece mas que ainda não têm parquet aparecem com
+  `status="nao_extraida"` (0 arquivos/linhas); sem nenhum `discover` salvo
+  em `config_dir`, o relatório ainda lista as tabelas extraídas, mas
+  `expected_rows`/`diff` ficam vazios (`status="sem_discover"`).
 - `count_loaded_rows(output_dir, schema, table)` / `check_row_counts(model, output_dir)`:
   conta linhas lendo só metadados do parquet (sem carregar os dados) e compara
-  com a contagem levantada pelo `discover`.
+  com a contagem levantada pelo `discover`. Diferente de `load_status`, exige
+  o `model` do `discover` em mãos (mas dá o `status` "nao_extraida" por
+  tabela na mesma linha, sem precisar rodar duas consultas separadas).
 - `check_duplicate_ids(output_dir, schema, table, config_dir)` /
   `check_duplicates_all(model, output_dir, config_dir)`: verifica se a coluna
   usada para particionar/ordenar (`id` ou `id_c`, a mesma persistida em

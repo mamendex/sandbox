@@ -17,6 +17,7 @@ from i3_shift_lake.validate import (
     check_row_counts,
     check_unique,
     count_loaded_rows,
+    load_status,
     run_checks,
 )
 
@@ -36,6 +37,7 @@ __all__ = [
     "clear_checkpoint",
     "TableLoader",
     "count_loaded_rows",
+    "load_status",
     "check_row_counts",
     "check_duplicate_ids",
     "check_duplicates_all",

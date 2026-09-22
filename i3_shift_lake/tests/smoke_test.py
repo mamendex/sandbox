@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from i3_shift_lake import (  # noqa: E402
     ping, discover, extract_all, load_model, load_table_query, TableLoader,
-    check_row_counts, check_duplicate_ids, check_duplicates_all,
+    check_row_counts, check_duplicate_ids, check_duplicates_all, load_status,
     check_unique, check_foreign_key, run_checks,
     load_checkpoint,
 )
@@ -304,6 +304,29 @@ def main() -> None:
         print(row_counts_report.to_string())
         assert (row_counts_report["status"] == "ok").all()
         assert (row_counts_report["diff"] == 0).all()
+
+        print("\n=== validate: load_status (relatorio da situacao da carga) ===")
+        status_report = load_status(output_dir, SCHEMA, config_dir=config_dir)
+        print(status_report.to_string())
+        status_by_table = status_report.set_index("table_name")
+        assert status_by_table.loc["accounts", "status"] == "ok"
+        assert status_by_table.loc["accounts", "diff"] == 0
+        assert status_by_table.loc["accounts", "parquet_files"] > 0
+        assert status_by_table.loc["custom_leads_c", "status"] == "ok"
+        # empty_table tem 0 linhas no discover -> extract_all pula (tables_with_rows),
+        # entao nunca foi extraida: cenario real de tabela conhecida mas ainda sem parquet.
+        assert status_by_table.loc["empty_table", "status"] == "nao_extraida"
+        assert status_by_table.loc["empty_table", "parquet_files"] == 0
+        assert status_by_table.loc["empty_table", "rows_loaded"] == 0
+        assert pd.isna(status_by_table.loc["empty_table", "diff"])
+        print("load_status: ok / diffs corretos / tabela nao extraida sinalizada")
+
+        print("\n=== validate: load_status sem discover salvo (config_dir vazio) ===")
+        no_discover_dir = os.path.join(base_dir, "config_sem_discover")
+        status_no_discover = load_status(output_dir, SCHEMA, config_dir=no_discover_dir)
+        assert (status_no_discover["status"] == "sem_discover").all()
+        assert status_no_discover["expected_rows"].isna().all()
+        print("load_status sem discover: status 'sem_discover' para todas as tabelas extraidas")
 
         print("\n=== validate: check_duplicate_ids (sem duplicatas esperado) ===")
         dup_report = check_duplicates_all(model, output_dir, config_dir=config_dir)
