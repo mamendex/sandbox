@@ -85,9 +85,17 @@ def coerce_dtypes(df: pd.DataFrame, column_types: dict[str, str]) -> pd.DataFram
 
 
 def _format_literal(value, redshift_type: str | None) -> str:
-    """Formata um valor de checkpoint como literal SQL (com aspas para texto/data)."""
+    """Formata um valor de checkpoint como literal SQL (com aspas para texto/data).
+
+    Datas/timestamps levam um cast explícito (`::timestamp`) em vez de depender de cast
+    implícito de string dentro da comparação por tupla — o Redshift aceita normalmente,
+    e alguns motores (ex.: DuckDB) exigem o cast explícito nesse contexto.
+    """
     target = _target_dtype(redshift_type) if redshift_type else None
-    if target in ("string", "datetime64[ns]") or (target is None and isinstance(value, str)):
+    if target == "datetime64[ns]":
+        escaped = str(value).replace("'", "''")
+        return f"'{escaped}'::timestamp"
+    if target == "string" or (target is None and isinstance(value, str)):
         escaped = str(value).replace("'", "''")
         return f"'{escaped}'"
     return str(value)
