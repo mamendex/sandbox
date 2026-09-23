@@ -32,6 +32,7 @@ from i3_shift_lake import (  # noqa: E402
     check_row_counts, check_duplicate_ids, check_duplicates_all, load_status,
     check_unique, check_foreign_key, run_checks,
     load_checkpoint, compact_table,
+    Entity, Source, Join, ForeignKey, build_entity, build_all, check_foreign_keys,
 )
 from i3_shift_lake.extract import extract_table, NULL_DATE_SENTINEL, bucket_for  # noqa: E402
 
@@ -775,6 +776,171 @@ def main() -> None:
         )
         assert report_idempotente.empty, "sem arquivos novos desde a ultima compactacao, nao ha nada a fazer"
         print("compactacao e idempotente: rodar de novo sem novas cargas nao muda nada")
+
+        print("\n=== silver: build_entity/build_all monta entidades a partir da raw ===")
+        silver_raw_tables = {
+            "XPTO": pd.DataFrame(
+                {
+                    "id": range(1, 6),
+                    "NOME": [f"Produto {i}" for i in range(1, 6)],
+                    "date_modified": pd.date_range("2024-01-01", periods=5, freq="D"),
+                }
+            ),
+            "BETA": pd.DataFrame(
+                {
+                    "id": range(1, 11),
+                    "rotulo": [f"beta-{i}" for i in range(1, 11)],
+                    "ativo": [True] * 8 + [False] * 2,  # ids 9 e 10 inativos
+                    "date_modified": pd.date_range("2024-02-01", periods=10, freq="D"),
+                }
+            ),
+            "GAMA": pd.DataFrame(
+                {
+                    "id_c": [1, 2, 3, 4, 5, 6, 7, 8, 9, 99],  # 99 nao existe em BETA
+                    "pontuacao": [10, 20, 30, 40, 50, 60, 70, 80, 90, 990],
+                    "date_modified": pd.date_range("2024-03-01", periods=10, freq="D"),
+                }
+            ),
+            "X": pd.DataFrame(
+                {
+                    "id": range(1, 6),
+                    "XPTO_ID": [1, 2, 3, 4, 5],
+                    "ALFA_ID": [1, 2, 3, 4, 999],  # 999 nao existe em alfa: violacao de FK proposital
+                    "date_modified": pd.date_range("2024-04-01", periods=5, freq="D"),
+                }
+            ),
+        }
+        silver_columns_df = pd.DataFrame(columns=["table_name", "column_name", "data_type", "ordinal_position"])
+        silver_query = make_fake_query(silver_raw_tables, silver_columns_df)
+
+        raw_output_dir = f"{base_dir}/out_silver_raw"
+        raw_config_dir = f"{base_dir}/config_silver_raw"
+        raw_control_dir = f"{base_dir}/control_silver_raw"
+
+        xpto_types = {"id": "integer", "date_modified": "timestamp without time zone"}
+        beta_types = {"id": "integer", "ativo": "boolean", "date_modified": "timestamp without time zone"}
+        gama_types = {"id_c": "integer", "date_modified": "timestamp without time zone"}
+        x_types = {"id": "integer", "date_modified": "timestamp without time zone"}
+
+        for table, cols, types in [
+            ("XPTO", ["id", "NOME", "date_modified"], xpto_types),
+            ("BETA", ["id", "rotulo", "ativo", "date_modified"], beta_types),
+            ("GAMA", ["id_c", "pontuacao", "date_modified"], gama_types),
+            ("X", ["id", "XPTO_ID", "ALFA_ID", "date_modified"], x_types),
+        ]:
+            extract_table(
+                silver_query, SCHEMA, table, cols, raw_output_dir,
+                config_dir=raw_config_dir, control_dir=raw_control_dir, column_types=types,
+            )
+
+        raw_loader = TableLoader(raw_output_dir, schema=SCHEMA, config_dir=raw_config_dir)
+
+        # entidade xpto = tabela XPTO da raw (so renomeia NOME -> nome)
+        xpto_entity = Entity(
+            name="xpto", id_column="id",
+            sources=[Source(table="XPTO", rename={"NOME": "nome"})],
+        )
+        # entidade alfa = juncao de BETA.id com GAMA.id_c, filtrando BETA pelos ativos
+        # e renomeando date_modified de GAMA pra evitar colisao com o de BETA
+        alfa_entity = Entity(
+            name="alfa", id_column="id",
+            sources=[
+                Source(table="BETA", where="ativo == True"),
+                Source(table="GAMA", rename={"date_modified": "date_modified_gama"}),
+            ],
+            joins=[Join(left_on="id", right_on="id_c", how="inner")],
+        )
+        # relacionamento rel = tabela X, vincula xpto.id (rel.xpto_id) e alfa.id (rel.alfa_id)
+        rel_entity = Entity(
+            name="rel", id_column="id",
+            sources=[Source(table="X", rename={"XPTO_ID": "xpto_id", "ALFA_ID": "alfa_id"})],
+            foreign_keys=[
+                ForeignKey(column="xpto_id", entity="xpto", entity_column="id"),
+                ForeignKey(column="alfa_id", entity="alfa", entity_column="id"),
+            ],
+        )
+
+        silver_output_dir = f"{base_dir}/out_silver"
+        silver_config_dir = f"{base_dir}/config_silver"
+        entities = [xpto_entity, alfa_entity, rel_entity]
+
+        build_report = build_all(entities, raw_loader, silver_output_dir, SCHEMA, config_dir=silver_config_dir)
+        print(build_report.to_string())
+        report_by_name = build_report.set_index("entity_name")
+        assert report_by_name.loc["xpto", "rows"] == 5
+        assert report_by_name.loc["alfa", "rows"] == 8, "so os ids ativos de BETA (1..8) que existem em GAMA"
+        assert report_by_name.loc["rel", "rows"] == 5
+
+        silver_loader = TableLoader(silver_output_dir, schema=SCHEMA, config_dir=silver_config_dir)
+
+        df_xpto = silver_loader["xpto"]
+        assert "nome" in df_xpto.columns and "NOME" not in df_xpto.columns
+        assert set(df_xpto["nome"]) == {f"Produto {i}" for i in range(1, 6)}
+        print("xpto: passthrough da raw com rename de coluna, 5 linhas")
+
+        df_alfa = silver_loader["alfa"]
+        assert set(df_alfa["id"]) == set(range(1, 9)), "so os ids ativos de BETA que existem em GAMA"
+        assert "date_modified_gama" in df_alfa.columns and "date_modified" in df_alfa.columns, (
+            "rename anti-colisao: as duas datas (BETA e GAMA) devem sobreviver, sem _x/_y"
+        )
+        print("alfa: merge BETA.id x GAMA.id_c com filtro de linha (ativo) e rename anti-colisao, 8 linhas")
+
+        df_rel = silver_loader["rel"]
+        assert set(df_rel.columns) >= {"id", "xpto_id", "alfa_id"}
+        print("rel: relacionamento com FKs renomeadas para xpto_id/alfa_id")
+
+        fk_report = check_foreign_keys(entities, silver_loader)
+        print(fk_report.to_string())
+        fk_xpto = fk_report[(fk_report["table_name"] == "rel") & (fk_report["check_name"] == "fk:xpto_id->id")].iloc[0]
+        fk_alfa = fk_report[(fk_report["table_name"] == "rel") & (fk_report["check_name"] == "fk:alfa_id->id")].iloc[0]
+        assert fk_xpto["status"] == "ok", "todo rel.xpto_id existe em xpto.id"
+        assert fk_alfa["status"] == "falhou", "rel.alfa_id=999 nao existe em alfa.id (violacao proposital)"
+        print("check_foreign_keys: pega a violacao proposital em rel.alfa_id, xpto_id ok")
+
+        # full rebuild: reativa um id de BETA (que ja existe em GAMA) e reconstroi so a
+        # entidade alfa -- tem que refletir a mudanca por completo, sem sobrar nada da
+        # versao anterior (sem acumular arquivo por build, diferente da raw)
+        silver_raw_tables["BETA"].loc[silver_raw_tables["BETA"]["id"] == 9, "ativo"] = True
+        silver_raw_tables["BETA"].loc[silver_raw_tables["BETA"]["id"] == 9, "date_modified"] = (
+            pd.Timestamp("2024-02-01") + pd.Timedelta(days=100)
+        )
+        extract_table(
+            silver_query, SCHEMA, "BETA", ["id", "rotulo", "ativo", "date_modified"], raw_output_dir,
+            config_dir=raw_config_dir, control_dir=raw_control_dir, column_types=beta_types,
+        )
+        build_entity(alfa_entity, raw_loader, silver_output_dir, SCHEMA, config_dir=silver_config_dir)
+
+        df_alfa_v2 = TableLoader(silver_output_dir, schema=SCHEMA, config_dir=silver_config_dir)["alfa"]
+        assert set(df_alfa_v2["id"]) == set(range(1, 10)), "id=9 reativado (e presente em GAMA) deveria entrar"
+        alfa_files_depois = len(
+            ds.dataset(os.path.join(silver_output_dir, SCHEMA, "alfa"), format="parquet").files
+        )
+        assert alfa_files_depois <= len(df_alfa_v2), (
+            "rebuild completo escreve tudo numa unica passada: no maximo 1 arquivo por bucket "
+            "tocado, nunca acumula arquivo de builds anteriores"
+        )
+        print(f"rebuild completo: alfa refeita do zero, agora com {len(df_alfa_v2)} linhas, sem acumular arquivos")
+
+        # validacoes: numero de joins tem que bater com numero de fontes - 1
+        try:
+            build_entity(
+                Entity(name="invalido", id_column="id", sources=[Source(table="BETA"), Source(table="GAMA")], joins=[]),
+                raw_loader, silver_output_dir, SCHEMA, config_dir=silver_config_dir,
+            )
+            assert False, "deveria falhar por numero de joins incompativel com numero de fontes"
+        except ValueError:
+            pass
+
+        # validacao: id_column tem que existir apos filtros/renomeios/merge
+        try:
+            build_entity(
+                Entity(name="invalido2", id_column="coluna_inexistente", sources=[Source(table="XPTO")]),
+                raw_loader, silver_output_dir, SCHEMA, config_dir=silver_config_dir,
+            )
+            assert False, "deveria falhar por id_column inexistente"
+        except ValueError:
+            pass
+        print("build_entity valida joins incompativeis e id_column inexistente")
 
         print("\nOK: smoke test passou")
     finally:

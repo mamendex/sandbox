@@ -333,3 +333,91 @@ checks = [
 ]
 relatorio_qualidade = run_checks(checks)
 ```
+
+## Camada silver: entidades e relacionamentos (`i3_shift_lake/silver.py`)
+
+A raw só faz o "shift" da fonte pra parquet — sem renomear nada, sem juntar
+tabelas. A silver é onde isso acontece: filtro de colunas, filtro de linhas,
+merge de tabelas e renomeio de colunas/tabelas, seguindo a mesma filosofia
+do resto do pacote — tudo com pandas puro (`rename`/`query`/`merge`), sem
+motor de execução ou DSL próprios. Uma "entidade" (ou "relacionamento" — é a
+mesma coisa aqui) é só uma declaração de que fontes raw usar e como
+combiná-las; `build_entity` executa isso e grava o resultado em parquet,
+particionado por bucket como a raw (`OUTPUT_DIR_SILVER/<schema>/<entidade>/`).
+
+Diferença importante em relação à raw: **cada build reconstrói a entidade
+inteira do zero** a partir do estado atual da raw (já incremental e
+dedupada pelo `TableLoader`) e substitui por completo o que existia — não
+há carga incremental nem checkpoint próprios pra silver. Isso é uma escolha
+deliberada de simplicidade: as entidades (a configuração de quais
+tabelas/colunas/joins formam cada uma) mudam raro, e cada build já parte da
+raw mais recente, então não precisa reprocessar só o incremento — e sem
+incremental, também não há o problema de arquivo acumulado que motivou o
+`compact_table` na raw.
+
+```python
+from i3_shift_lake import Entity, Source, Join, ForeignKey, build_entity, build_all, check_foreign_keys, TableLoader
+
+raw = TableLoader(OUTPUT_DIR, schema=SCHEMA, config_dir=CONFIG_DIR)
+
+# a entidade xpto na camada silver e a tabela XPTO na raw
+xpto = Entity(name="xpto", id_column="id", sources=[Source(table="XPTO")])
+
+# a entidade alfa na silver e a juncao da tabela BETA.id com a GAMA.id_c da raw
+alfa = Entity(
+    name="alfa",
+    id_column="id",
+    sources=[Source(table="BETA"), Source(table="GAMA")],
+    joins=[Join(left_on="id", right_on="id_c")],
+)
+
+# o relacionamento rel na silver e a tabela X, vinculando xpto.id (rel.xpto_id)
+# e alfa.id (rel.alfa_id)
+rel = Entity(
+    name="rel",
+    id_column="id",
+    sources=[Source(table="X", rename={"XPTO_ID": "xpto_id", "ALFA_ID": "alfa_id"})],
+    foreign_keys=[
+        ForeignKey(column="xpto_id", entity="xpto", entity_column="id"),
+        ForeignKey(column="alfa_id", entity="alfa", entity_column="id"),
+    ],
+)
+
+build_all([xpto, alfa, rel], raw, SILVER_OUTPUT_DIR, SCHEMA, config_dir=SILVER_CONFIG_DIR)
+
+# le a silver de volta com o mesmo TableLoader que ja existe pra raw
+silver = TableLoader(SILVER_OUTPUT_DIR, schema=SCHEMA, config_dir=SILVER_CONFIG_DIR)
+df_alfa = silver.load("alfa")
+
+# roda check_foreign_key (validate.py) pra cada ForeignKey declarada
+check_foreign_keys([xpto, alfa, rel], silver)
+```
+
+- `Source(table, columns=None, rename={}, where=None)`: uma fonte raw. `where`
+  é uma string de `DataFrame.query()` sobre as colunas **originais** (antes
+  do rename); `columns` filtra colunas (e precisa incluir qualquer coluna
+  usada em `where` ou nos `joins`); `rename` roda antes do merge — use pra
+  resolver colisão de nome entre fontes (ex.: as duas tendo `date_modified`).
+- `Join(left_on, right_on, how="inner")`: mesmo vocabulário do `pd.merge`.
+  Uma `Entity` com N fontes precisa de N-1 joins, aplicados em sequência
+  (a 2ª fonte junta com a 1ª, a 3ª com o resultado disso, etc.).
+- `Entity(name, id_column, sources, joins=[], columns=None, foreign_keys=[])`:
+  `id_column` é a coluna (já com nome final, pós-rename/merge) usada pra
+  particionar o parquet — assim como `id`/`id_c` na raw. `columns` restringe
+  a seleção final (`None` = mantém tudo). `foreign_keys` só documenta e
+  habilita `check_foreign_keys` — não afeta o build.
+- `build_entity(entity, raw, output_dir, schema, config_dir, num_buckets=32)`:
+  lê as fontes via `TableLoader` (raw), aplica filtro/rename/merge e grava o
+  parquet inteiro de novo, num diretório temporário que só troca de lugar
+  com o anterior depois de terminar com sucesso — se algo falhar no meio,
+  a versão anterior da entidade continua intacta. `build_all` roda uma lista
+  de entidades em sequência (a ordem importa se uma entidade compuser outra
+  entidade silver como fonte, via um segundo `TableLoader` apontado pro
+  output da silver).
+- `check_foreign_keys(entities, silver)`: roda `check_foreign_key` pra cada
+  `ForeignKey` declarada, carregando cada entidade referenciada uma única
+  vez (cache interno), mesmo que várias FKs apontem pra ela.
+
+A entidade resultante tem exatamente o mesmo formato físico da raw (parquet
+particionado por bucket), então é lida com o **mesmo `TableLoader`** — não
+existe um leitor separado pra silver.
