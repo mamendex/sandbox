@@ -23,6 +23,7 @@ from contextlib import redirect_stdout
 from functools import partial
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.dataset as ds
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
@@ -34,7 +35,7 @@ from i3_shift_lake import (  # noqa: E402
     load_checkpoint, compact_table,
     Entity, Source, Join, ForeignKey, build_entity, build_all, check_foreign_keys,
 )
-from i3_shift_lake.extract import extract_table, NULL_DATE_SENTINEL, bucket_for  # noqa: E402
+from i3_shift_lake.extract import extract_table, NULL_DATE_SENTINEL, bucket_for, _write_page  # noqa: E402
 
 SCHEMA = "meu_schema"
 
@@ -941,6 +942,44 @@ def main() -> None:
         except ValueError:
             pass
         print("build_entity valida joins incompativeis e id_column inexistente")
+
+        print(
+            "\n=== TableLoader: contorno de schema inconsistente entre paginas ja gravadas "
+            "(sem column_types na escrita) ==="
+        )
+        # reproduz o bug de verdade: grava 2 paginas direto com _write_page (sem coerce_dtypes/
+        # column_types), uma com "notes" 100% nula (pyarrow infere tipo `null`) e outra com
+        # "notes" de texto real (`large_string`) -- e exatamente o ArrowNotImplementedError
+        # ("Unsupported cast from large_string to null") que o TableLoader precisa contornar.
+        drift_output_dir = f"{base_dir}/out_schema_drift"
+        drift_table = "tabela_schema_drift"
+        drift_table_dir = os.path.join(drift_output_dir, SCHEMA, drift_table)
+
+        page_nula = pd.DataFrame(
+            {"id": [1, 2, 3], "notes": [None, None, None], "date_modified": pd.date_range("2024-01-01", periods=3)}
+        )
+        page_real = pd.DataFrame(
+            {"id": [4, 5, 6], "notes": ["a", "b", "c"], "date_modified": pd.date_range("2024-01-04", periods=3)}
+        )
+        _write_page(page_nula, drift_table_dir, "id", num_buckets=4)
+        _write_page(page_real, drift_table_dir, "id", num_buckets=4)
+
+        try:
+            pd.read_parquet(drift_table_dir, engine="pyarrow")
+            raise AssertionError(
+                "esperava que a leitura direta (sem contorno) falhasse com schema inconsistente "
+                "-- o teste nao reproduziu o bug real"
+            )
+        except pa.lib.ArrowException:
+            pass  # confirma que o bug de verdade foi reproduzido antes de testar o contorno
+
+        drift_loader = TableLoader(drift_output_dir, schema=SCHEMA, config_dir=f"{base_dir}/config_inexistente")
+        df_drift = drift_loader.load(drift_table, dedupe=False)
+        assert df_drift.shape[0] == 6
+        assert set(df_drift["id"]) == set(range(1, 7))
+        assert df_drift.loc[df_drift["id"] <= 3, "notes"].isna().all()
+        assert list(df_drift.loc[df_drift["id"] > 3].sort_values("id")["notes"]) == ["a", "b", "c"]
+        print("TableLoader contorna schema inconsistente entre paginas (le arquivo por arquivo e junta)")
 
         print("\nOK: smoke test passou")
     finally:

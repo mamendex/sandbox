@@ -314,6 +314,16 @@ mapeados ou que falhem na conversão ficam como o pandas inferiu.
 > comportamento fica igual ao de antes dessa correção. Rode `discover()` de
 > novo para atualizar o `config_dir` com os tipos.
 
+`column_types` evita que o problema aconteça em cargas **novas**. Para parquets
+que já foram gravados sem essa coerção (de antes dessa correção, ou de uma
+chamada direta a `extract_table()`/`extract_all()` sem passar `column_types`),
+o `TableLoader.load()` detecta a falha de unificação de schema
+(`ArrowNotImplementedError`/`ArrowTypeError`) e cai automaticamente para uma
+leitura arquivo por arquivo (schema consistente dentro de cada um) — mais
+lenta, mas não quebra. Ele avisa quando isso acontece; se aparecer, vale
+rodar um `load_mode="full"` com `column_types` pra essa tabela pra corrigir
+de vez os arquivos em disco.
+
 ## Validação da carga (`i3_shift_lake/validate.py`)
 
 ```python

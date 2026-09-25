@@ -6,8 +6,36 @@ import os
 import time
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.dataset as ds
 
 from i3_shift_lake.extract import DEFAULT_CONFIG_DIR, load_table_query
+
+
+def _read_table(path: str, columns: list[str] | None, schema: str, table: str) -> pd.DataFrame:
+    """Lê os parquets de uma tabela, com contorno pra schema inconsistente entre páginas.
+
+    Uma página inteiramente nula numa coluna (ex.: extraída antes de usar `column_types`,
+    ou sem `column_types` pra essa tabela) fica com tipo `null` naquele arquivo, incompatível
+    com o tipo real (`large_string`/`int64`/etc.) dos demais — o pyarrow recusa a unificar
+    isso numa leitura só (`ArrowNotImplementedError`/`ArrowTypeError`: "Unsupported cast from
+    ... to null"). Quando isso acontece, cai pra ler arquivo por arquivo (schema consistente
+    dentro de cada um) e junta com `pd.concat`, que é bem mais permissivo que o pyarrow pra
+    combinar uma coluna toda nula com uma de tipo real.
+    """
+    try:
+        return pd.read_parquet(path, columns=columns, engine="pyarrow")
+    except pa.lib.ArrowException:
+        print(
+            f"[TableLoader.load] AVISO: {schema}.{table} tem parquets com schema inconsistente "
+            f"entre páginas (coluna(s) totalmente nula(s) nalguma página) — lendo arquivo por "
+            f"arquivo como contorno; considere um load_mode='full' com column_types pra corrigir "
+            f"de vez",
+            flush=True,
+        )
+        files = ds.dataset(path, format="parquet").files
+        parts = [pd.read_parquet(f, columns=columns, engine="pyarrow") for f in files]
+        return pd.concat(parts, ignore_index=True)
 
 
 class TableLoader:
@@ -80,7 +108,7 @@ class TableLoader:
 
         start = time.perf_counter()
         print(f"[TableLoader.load] lendo {self.schema}.{table} de {path}...", flush=True)
-        df = pd.read_parquet(path, columns=read_columns, engine="pyarrow")
+        df = _read_table(path, read_columns, self.schema, table)
         if drop_bucket and "bucket" in df.columns:
             df = df.drop(columns=["bucket"])
 
