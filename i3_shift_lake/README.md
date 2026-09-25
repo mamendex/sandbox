@@ -132,6 +132,43 @@ extract_all(query, model, OUTPUT_DIR, config_dir=CONFIG_DIR, control_dir=CONTROL
 Para inspecionar ou resetar manualmente: `load_checkpoint(schema, tabela, control_dir=...)`
 e `clear_checkpoint(schema, tabela, control_dir=...)`.
 
+## Guia rápido: como carregar uma tabela do zero
+
+1. **Decida o `sample_size` e use o mesmo valor em toda chamada dessa tabela
+   dali pra frente** — `None` (o default) pra carga de verdade, um número só
+   se for teste/dev. `sample_size` e `load_mode` são independentes: um
+   `sample_size` fixo esquecido em produção limita **toda** carga a esse teto,
+   full ou incremental, silenciosamente — a carga nunca dá erro, só nunca
+   termina de trazer o resto da tabela. Foi exatamente isso que já causou uma
+   tabela carregar só ~3% do esperado por semanas: cada carga incremental
+   ficava presa lendo só as primeiras `sample_size` linhas a partir do
+   checkpoint, sempre atrás do volume real.
+
+2. **Primeira carga da tabela: `load_mode="full"`** — começa do zero (apaga
+   parquet e checkpoint anteriores, se houver).
+
+   ```python
+   extract_table(query, SCHEMA, "tabela", colunas, OUTPUT_DIR,
+                  config_dir=CONFIG_DIR, control_dir=CONTROL_DIR,
+                  load_mode="full", sample_size=None)
+   ```
+
+3. **Confira antes de seguir** — `load_status` com `pct` em 100 confirma que
+   a carga full trouxe a tabela inteira, não um pedaço:
+
+   ```python
+   load_status(OUTPUT_DIR, SCHEMA, config_dir=CONFIG_DIR)
+   ```
+
+4. **Cargas seguintes: `load_mode="incremental"`** (o default) — retoma
+   automaticamente de onde a última parou, trazendo só o que é novo/mudou:
+
+   ```python
+   extract_table(query, SCHEMA, "tabela", colunas, OUTPUT_DIR,
+                  config_dir=CONFIG_DIR, control_dir=CONTROL_DIR,
+                  sample_size=None)
+   ```
+
 ## Sem gaps, sem overlap de versão igual, substitui ao modificar
 
 Cada página vira um arquivo parquet novo (nunca sobrescrito). Se um registro é
