@@ -18,6 +18,8 @@ from i3_shift_lake.silver import (
     build_all,
     build_entity,
     check_foreign_keys,
+    load_entity,
+    save_entity,
 )
 from i3_shift_lake.transform import TableLoader
 from i3_shift_lake.validate import (
@@ -51,6 +53,8 @@ __all__ = [
     "Join",
     "ForeignKey",
     "Entity",
+    "load_entity",
+    "save_entity",
     "build_entity",
     "build_all",
     "check_foreign_keys",

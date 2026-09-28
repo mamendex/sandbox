@@ -469,6 +469,34 @@ A entidade resultante tem exatamente o mesmo formato físico da raw (parquet
 particionado por bucket), então é lida com o **mesmo `TableLoader`** — não
 existe um leitor separado pra silver.
 
+### Processamento com pandas puro entre a leitura e a gravação (`load_entity`/`save_entity`)
+
+`build_entity` cobre o que já está declarado em `Source`/`Join`: filtro de
+linha (`where`), filtro de coluna (`columns`), rename e merge. Mas selecionar
+colunas de outro jeito, ajustar valores (calcular uma coluna nova, aplicar
+uma conversão) ou qualquer transformação que não seja uma dessas quatro
+operações fica melhor como código pandas direto, sem tentar encaixar numa
+declaração — é pra isso que `build_entity` se separa em duas metades:
+
+```python
+from i3_shift_lake import load_entity, save_entity
+
+df = load_entity(alfa, raw)          # so a leitura+merge (Source/Join), sem gravar nada
+df = df[df["ativo"]]                 # filtro de linha
+df["pontuacao_normalizada"] = df["pontuacao"] / df["pontuacao"].max()  # ajuste de valor
+df = df.rename(columns={"rotulo": "nome"})  # renomeio
+df = df[["id", "nome", "pontuacao_normalizada"]]  # selecao de colunas
+
+save_entity(df, "alfa", "id", SILVER_OUTPUT_DIR, SCHEMA, config_dir=SILVER_CONFIG_DIR)
+```
+
+`save_entity(df, name, id_column, output_dir, schema, config_dir, num_buckets=32)`
+aceita **qualquer** DataFrame pronto (de `load_entity`, ou de qualquer outra
+origem) e grava exatamente como `build_entity` grava — mesmo diretório
+temporário + troca atômica, mesma config persistida pro `TableLoader` ler
+de volta. `build_entity` é só `load_entity` + `save_entity` sem passo de
+pandas no meio.
+
 ### Atalho declarativo (`SilverModel`)
 
 Pra montar entidades/relacionamentos simples sem escrever `Entity`/`Source`/
@@ -513,9 +541,29 @@ modelo.check_foreign_keys(silver)
 - `build_all`/`check_foreign_keys` (métodos): mesma coisa que as funções livres
   do mesmo nome, só que já com a lista de entidades registradas no `SilverModel`.
 
-Pra transformações que não cabem nesse atalho (filtro de linha, seleção de
-colunas, join com `how` diferente de `left`/`inner`, mais de duas fontes),
-use `Entity`/`Source`/`Join`/`ForeignKey`/`build_entity` diretamente — os dois
-níveis convivem: `modelo.entities` é um `dict[str, Entity]` comum, então dá
-pra registrar uma entidade complexa na mão e ainda usá-la num
-`modelo.relacionamento(...)` depois.
+Quando precisar de mais do que o passthrough/merge-com-custom (filtro de
+linha, ajuste de valor, seleção de colunas, rename), use `.carregar`/
+`.persistir` — mesma ideia de `load_entity`/`save_entity`, mas reaproveitando
+o `id_column` já derivado pela entidade registrada:
+
+```python
+df = modelo.carregar("alfa")               # so o load+merge ja declarado em entidade()
+df = df[df["ativo"]]                       # filtro de linha
+df["pontuacao_normalizada"] = df["pontuacao"] / df["pontuacao"].max()  # ajuste de valor
+df = df.rename(columns={"rotulo": "nome"})[["id", "nome", "pontuacao_normalizada"]]
+
+modelo.persistir("alfa", df, SILVER_OUTPUT_DIR, SCHEMA, config_dir=SILVER_CONFIG_DIR)
+```
+
+- `carregar(nome_da_entidade)`: executa o load+merge da entidade/relacionamento
+  já registrado (sem gravar nada) — equivalente a `load_entity(modelo.entities[nome], raw)`.
+- `persistir(nome_da_entidade, df, output_dir, schema, config_dir, num_buckets=32, id_column=None)`:
+  grava o DataFrame processado. Usa o `id_column` da entidade registrada por
+  padrão; passe `id_column` explicitamente se o pandas no meio renomeou essa
+  coluna.
+
+Pra joins com `how` diferente de `left`/`inner` ou mais de duas fontes, use
+`Entity`/`Source`/`Join`/`ForeignKey` diretamente — os dois níveis convivem:
+`modelo.entities` é um `dict[str, Entity]` comum, então dá pra registrar uma
+entidade complexa na mão e ainda usá-la num `modelo.relacionamento(...)` ou
+`modelo.persistir(...)` depois.

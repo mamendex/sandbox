@@ -34,6 +34,7 @@ from i3_shift_lake import (  # noqa: E402
     check_unique, check_foreign_key, run_checks,
     load_checkpoint, compact_table,
     Entity, Source, Join, ForeignKey, build_entity, build_all, check_foreign_keys, SilverModel,
+    load_entity, save_entity,
 )
 from i3_shift_lake.extract import extract_table, NULL_DATE_SENTINEL, bucket_for, _write_page  # noqa: E402
 
@@ -1009,6 +1010,63 @@ def main() -> None:
         except ValueError:
             pass
         print("SilverModel valida entidade nao registrada e tabela raw sem config persistida")
+
+        print(
+            "\n=== silver: load_entity/save_entity e SilverModel.carregar/.persistir "
+            "(processamento pandas entre leitura e gravacao) ==="
+        )
+        # load_entity/save_entity "crus": pega o DataFrame de uma Entity ja existente
+        # (a "alfa" do bloco anterior), processa com pandas puro e grava com um nome novo
+        df_alfa_bruta = load_entity(alfa_entity, raw_loader)
+        assert set(df_alfa_bruta.columns) >= {"id", "rotulo", "ativo", "pontuacao"}
+        df_alfa_ajustada = df_alfa_bruta[["id", "rotulo", "pontuacao"]].copy()
+        df_alfa_ajustada["pontuacao_dobrada"] = df_alfa_ajustada["pontuacao"] * 2  # ajuste de valor
+        df_alfa_ajustada = df_alfa_ajustada.rename(columns={"rotulo": "nome"})  # renomeio
+
+        save_stats = save_entity(df_alfa_ajustada, "alfa_ajustada", "id", silver_output_dir, SCHEMA, config_dir=silver_config_dir)
+        # BETA id=9 ja foi reativado pelo bloco de rebuild completo, mais acima -- agora
+        # 1..9 estao ativos (so o 10 continua inativo), casando com GAMA.id_c ate 9
+        assert save_stats["rows"] == 9
+        df_alfa_ajustada_lida = TableLoader(silver_output_dir, schema=SCHEMA, config_dir=silver_config_dir)["alfa_ajustada"]
+        assert set(df_alfa_ajustada_lida.columns) == {"id", "nome", "pontuacao", "pontuacao_dobrada"}
+        assert (df_alfa_ajustada_lida["pontuacao_dobrada"] == df_alfa_ajustada_lida["pontuacao"] * 2).all()
+        print("load_entity/save_entity: filtro de colunas, ajuste de valor e rename com pandas puro entre leitura e gravacao")
+
+        # o mesmo fluxo, via SilverModel (entidade ja registrada, id_column derivado sozinho)
+        modelo.entidade("alfa3", "BETA")
+        df_alfa3 = modelo.carregar("alfa3")
+        assert set(df_alfa3.columns) == {"id", "rotulo", "ativo", "date_modified"}, (
+            "carregar() devolve so o load+merge, sem nenhum processamento"
+        )
+        df_alfa3 = df_alfa3[df_alfa3["ativo"]]  # filtro de linha
+        df_alfa3 = df_alfa3.rename(columns={"rotulo": "nome"})  # renomeio
+        df_alfa3["nome_upper"] = df_alfa3["nome"].str.upper()  # ajuste de valor
+        df_alfa3 = df_alfa3[["id", "nome", "nome_upper"]]  # selecao de colunas
+
+        persist_stats = modelo.persistir("alfa3", df_alfa3, modelo_output_dir, SCHEMA, config_dir=modelo_config_dir)
+        assert persist_stats["rows"] == 9, "so os ids ativos de BETA (1..9, o 10 continua inativo)"
+        df_alfa3_lida = TableLoader(modelo_output_dir, schema=SCHEMA, config_dir=modelo_config_dir)["alfa3"]
+        assert df_alfa3_lida.shape[0] == 9
+        assert set(df_alfa3_lida.columns) == {"id", "nome", "nome_upper"}
+        assert df_alfa3_lida.loc[df_alfa3_lida["id"] == 1, "nome_upper"].iloc[0] == "BETA-1"
+        print("SilverModel.carregar/.persistir: mesmo fluxo, id_column derivado da entidade ja registrada")
+
+        # .persistir aceita id_column explicito, pra quando o pandas renomeou a coluna de id
+        df_alfa3_renomeada = modelo.carregar("alfa3").rename(columns={"id": "id_renomeado"})
+        modelo.persistir(
+            "alfa3", df_alfa3_renomeada, modelo_output_dir, SCHEMA, config_dir=modelo_config_dir,
+            id_column="id_renomeado",
+        )
+        df_alfa3_v2 = TableLoader(modelo_output_dir, schema=SCHEMA, config_dir=modelo_config_dir).load("alfa3", dedupe=False)
+        assert "id_renomeado" in df_alfa3_v2.columns
+        print("SilverModel.persistir: id_column explicito cobre o caso de a coluna de id ter sido renomeada")
+
+        try:
+            save_entity(df_alfa_bruta, "invalida", "coluna_inexistente", silver_output_dir, SCHEMA, config_dir=silver_config_dir)
+            assert False, "deveria falhar por id_column inexistente no DataFrame"
+        except ValueError:
+            pass
+        print("save_entity valida id_column inexistente no DataFrame")
 
         print(
             "\n=== TableLoader: contorno de schema inconsistente entre paginas ja gravadas "
