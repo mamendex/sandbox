@@ -33,7 +33,7 @@ from i3_shift_lake import (  # noqa: E402
     check_row_counts, check_duplicate_ids, check_duplicates_all, load_status,
     check_unique, check_foreign_key, run_checks,
     load_checkpoint, compact_table,
-    Entity, Source, Join, ForeignKey, build_entity, build_all, check_foreign_keys,
+    Entity, Source, Join, ForeignKey, build_entity, build_all, check_foreign_keys, SilverModel,
 )
 from i3_shift_lake.extract import extract_table, NULL_DATE_SENTINEL, bucket_for, _write_page  # noqa: E402
 
@@ -943,6 +943,73 @@ def main() -> None:
             pass
         print("build_entity valida joins incompativeis e id_column inexistente")
 
+        print("\n=== SilverModel: entidade()/relacionamento() derivam id_column/entity_column da raw ===")
+        # XPTO_c = "campos customizados" de XPTO (padrao Salesforce): id=5 nao tem
+        # registro customizado (fica nulo apos o left join), e "date_modified" colide
+        # com o de XPTO -- testa o rename automatico com sufixo "_custom"
+        silver_raw_tables["XPTO_c"] = pd.DataFrame(
+            {
+                "id": [1, 2, 3, 4],
+                "categoria": ["eletronico", "eletronico", "moveis", "moveis"],
+                "date_modified": pd.date_range("2024-01-10", periods=4, freq="D"),
+            }
+        )
+        xpto_c_types = {"id": "integer", "date_modified": "timestamp without time zone"}
+        extract_table(
+            silver_query, SCHEMA, "XPTO_c", ["id", "categoria", "date_modified"], raw_output_dir,
+            config_dir=raw_config_dir, control_dir=raw_control_dir, column_types=xpto_c_types,
+        )
+
+        modelo = SilverModel(raw_loader)
+        modelo.entidade("xpto2", "XPTO", "XPTO_c")
+        modelo.entidade("alfa2", "BETA")
+        modelo.relacionamento("rel2", "xpto2", "alfa2", "X", "XPTO_ID", "ALFA_ID")
+
+        assert modelo.entities["xpto2"].id_column == "id", "id_column derivado do partition_column da raw"
+        xpto2_join = modelo.entities["xpto2"].joins[0]
+        assert xpto2_join.left_on == "id" and xpto2_join.right_on == "id"
+        assert modelo.entities["xpto2"].sources[1].rename == {"date_modified": "date_modified_custom"}, (
+            "colisao de 'date_modified' entre XPTO e XPTO_c deveria ganhar sufixo _custom automaticamente"
+        )
+        rel2_fks = {fk.column: fk.entity_column for fk in modelo.entities["rel2"].foreign_keys}
+        assert rel2_fks == {"XPTO_ID": "id", "ALFA_ID": "id"}, "entity_column derivado do id_column ja registrado"
+
+        modelo_output_dir = f"{base_dir}/out_silver_modelo"
+        modelo_config_dir = f"{base_dir}/config_silver_modelo"
+        modelo_report = modelo.build_all(modelo_output_dir, SCHEMA, config_dir=modelo_config_dir)
+        print(modelo_report.to_string())
+
+        modelo_loader = TableLoader(modelo_output_dir, schema=SCHEMA, config_dir=modelo_config_dir)
+        df_xpto2 = modelo_loader["xpto2"]
+        assert df_xpto2.shape[0] == 5, "left join preserva todos os 5 produtos, mesmo sem registro custom"
+        assert "categoria" in df_xpto2.columns
+        assert "date_modified" in df_xpto2.columns and "date_modified_custom" in df_xpto2.columns
+        assert df_xpto2.loc[df_xpto2["id"] == 5, "categoria"].isna().all(), "id=5 nao tem custom -> categoria nula"
+        assert df_xpto2.loc[df_xpto2["id"] == 1, "categoria"].iloc[0] == "eletronico"
+        print("SilverModel.entidade: merge com tabela custom, colisao de coluna renomeada com sufixo _custom")
+
+        fk_report2 = modelo.check_foreign_keys(modelo_loader)
+        print(fk_report2.to_string())
+        fk_xpto2 = fk_report2[(fk_report2["table_name"] == "rel2") & (fk_report2["check_name"] == "fk:XPTO_ID->id")].iloc[0]
+        fk_alfa2 = fk_report2[(fk_report2["table_name"] == "rel2") & (fk_report2["check_name"] == "fk:ALFA_ID->id")].iloc[0]
+        assert fk_xpto2["status"] == "ok", "todo X.XPTO_ID (1..5) existe em xpto2.id"
+        assert fk_alfa2["status"] == "falhou", "X.ALFA_ID=999 nao existe em alfa2.id (BETA so vai ate 10)"
+        print("SilverModel.relacionamento: entity_column derivado das entidades ja registradas, FK real detectada")
+
+        # validacoes: relacionamento com entidade nao registrada, e entidade com tabela raw sem config
+        try:
+            modelo.relacionamento("rel_invalido", "entidade_nao_existe", "alfa2", "X", "XPTO_ID", "ALFA_ID")
+            assert False, "deveria falhar por entidade nao registrada"
+        except ValueError:
+            pass
+
+        try:
+            modelo.entidade("tabela_sem_config", "tabela_que_nunca_foi_extraida")
+            assert False, "deveria falhar por tabela raw sem config persistida"
+        except ValueError:
+            pass
+        print("SilverModel valida entidade nao registrada e tabela raw sem config persistida")
+
         print(
             "\n=== TableLoader: contorno de schema inconsistente entre paginas ja gravadas "
             "(sem column_types na escrita) ==="
@@ -955,14 +1022,25 @@ def main() -> None:
         drift_table = "tabela_schema_drift"
         drift_table_dir = os.path.join(drift_output_dir, SCHEMA, drift_table)
 
+        # num_buckets=1 forca as duas paginas pro mesmo bucket=0/ (mesma particao fisica).
+        # o pyarrow so acusa a incompatibilidade se o arquivo "notes=null" for processado
+        # ANTES do "notes=texto" na unificacao de schema -- como o nome dos arquivos e um
+        # guid aleatorio, isso e sorte na ordem alfabetica; renomeamos na mao pra garantir
+        # que reproduz sempre (sem isso, o teste é instável).
         page_nula = pd.DataFrame(
             {"id": [1, 2, 3], "notes": [None, None, None], "date_modified": pd.date_range("2024-01-01", periods=3)}
         )
         page_real = pd.DataFrame(
             {"id": [4, 5, 6], "notes": ["a", "b", "c"], "date_modified": pd.date_range("2024-01-04", periods=3)}
         )
-        _write_page(page_nula, drift_table_dir, "id", num_buckets=4)
-        _write_page(page_real, drift_table_dir, "id", num_buckets=4)
+        _write_page(page_nula, drift_table_dir, "id", num_buckets=1)
+        drift_bucket_dir = os.path.join(drift_table_dir, "bucket=0")
+        nula_file = os.listdir(drift_bucket_dir)[0]
+        os.rename(os.path.join(drift_bucket_dir, nula_file), os.path.join(drift_bucket_dir, "0_nula.parquet"))
+
+        _write_page(page_real, drift_table_dir, "id", num_buckets=1)
+        real_file = [f for f in os.listdir(drift_bucket_dir) if f != "0_nula.parquet"][0]
+        os.rename(os.path.join(drift_bucket_dir, real_file), os.path.join(drift_bucket_dir, "1_real.parquet"))
 
         try:
             pd.read_parquet(drift_table_dir, engine="pyarrow")

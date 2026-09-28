@@ -468,3 +468,54 @@ check_foreign_keys([xpto, alfa, rel], silver)
 A entidade resultante tem exatamente o mesmo formato físico da raw (parquet
 particionado por bucket), então é lida com o **mesmo `TableLoader`** — não
 existe um leitor separado pra silver.
+
+### Atalho declarativo (`SilverModel`)
+
+Pra montar entidades/relacionamentos simples sem escrever `Entity`/`Source`/
+`Join`/`ForeignKey` na mão, `SilverModel` deriva `id_column`/`entity_column`
+sozinho — lendo o `partition_column` que a **raw já persistiu** pra cada
+tabela (`load_table_query`) e o `id_column` das entidades já registradas:
+
+```python
+from i3_shift_lake import SilverModel, TableLoader
+
+raw = TableLoader(OUTPUT_DIR, schema=SCHEMA, config_dir=CONFIG_DIR)
+modelo = SilverModel(raw)
+
+# a entidade xpto na silver e a tabela XPTO na raw
+modelo.entidade("xpto", "XPTO")
+
+# a entidade alfa na silver e a tabela BETA da raw, mesclada com os campos
+# customizados de BETA_c (ex.: modulo custom do SuiteCRM/Salesforce) por id —
+# BETA_c deixa de existir como conceito separado, vira so colunas extras de alfa
+modelo.entidade("alfa", "BETA", "BETA_c")
+
+# o relacionamento rel na silver e a tabela X, vinculando xpto e alfa
+modelo.relacionamento("rel", "xpto", "alfa", "X", "xpto_id", "alfa_id")
+
+modelo.build_all(SILVER_OUTPUT_DIR, SCHEMA, config_dir=SILVER_CONFIG_DIR)
+
+silver = TableLoader(SILVER_OUTPUT_DIR, schema=SCHEMA, config_dir=SILVER_CONFIG_DIR)
+modelo.check_foreign_keys(silver)
+```
+
+- `entidade(nome_da_entidade, nome_da_tabela_raw, nome_da_tabela_raw_custom=None)`:
+  sem a 3ª tabela, é um passthrough da tabela raw. Com ela, faz um `LEFT JOIN`
+  pelo `id`/`id_c` de cada tabela (lidos automaticamente da config da raw) —
+  linhas da tabela principal sem contrapartida na custom ficam com as colunas
+  extras nulas. Colunas com o mesmo nome nas duas tabelas (exceto a própria
+  chave de junção) ganham o sufixo `_custom` automaticamente, pra nunca colidir
+  sem avisar.
+- `relacionamento(nome_relacionamento, nome_da_entidade_a, nome_da_entidade_b, nome_da_tabela_rel_raw, nome_fk_a, nome_fk_b)`:
+  as duas entidades precisam já ter sido registradas via `entidade(...)` antes
+  — o `entity_column` de cada `ForeignKey` vem do `id_column` delas, sem
+  redeclarar.
+- `build_all`/`check_foreign_keys` (métodos): mesma coisa que as funções livres
+  do mesmo nome, só que já com a lista de entidades registradas no `SilverModel`.
+
+Pra transformações que não cabem nesse atalho (filtro de linha, seleção de
+colunas, join com `how` diferente de `left`/`inner`, mais de duas fontes),
+use `Entity`/`Source`/`Join`/`ForeignKey`/`build_entity` diretamente — os dois
+níveis convivem: `modelo.entities` é um `dict[str, Entity]` comum, então dá
+pra registrar uma entidade complexa na mão e ainda usá-la num
+`modelo.relacionamento(...)` depois.

@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from i3_shift_lake.discover import DEFAULT_CONFIG_DIR
-from i3_shift_lake.extract import _write_page, bucket_for, table_query_path
+from i3_shift_lake.extract import _write_page, bucket_for, load_table_query, table_query_path
 from i3_shift_lake.transform import TableLoader
 from i3_shift_lake.validate import CheckResult, check_foreign_key
 
@@ -198,3 +198,109 @@ def check_foreign_keys(entities: list[Entity], silver: TableLoader) -> pd.DataFr
             ref_df = _get(fk.entity)
             results.append(check_foreign_key(df, fk.column, ref_df, fk.entity_column, entity.name))
     return pd.DataFrame([r.__dict__ for r in results])
+
+
+class SilverModel:
+    """Atalho declarativo para montar entidades/relacionamentos silver a partir da
+    raw, sem repetir `id_column`/`entity_column` — eles são derivados automaticamente
+    do `partition_column` que a própria raw já persistiu (`load_table_query`) e do
+    `id_column` das entidades já registradas neste `SilverModel`.
+
+    Uso em notebook:
+        modelo = SilverModel(raw)  # raw = TableLoader apontado pro output da raw
+
+        modelo.entidade("xpto", "XPTO")
+        modelo.entidade("alfa", "BETA", "BETA_c")  # merge com a tabela de campos custom
+        modelo.relacionamento("rel", "xpto", "alfa", "X", "xpto_id", "alfa_id")
+
+        modelo.build_all(SILVER_OUTPUT_DIR, SCHEMA, config_dir=SILVER_CONFIG_DIR)
+    """
+
+    def __init__(self, raw: TableLoader, raw_config_dir: str | None = None):
+        self.raw = raw
+        self.raw_config_dir = raw_config_dir or raw.config_dir
+        self.entities: dict[str, Entity] = {}
+
+    def _raw_table_query(self, table: str) -> dict:
+        try:
+            return load_table_query(self.raw.schema, table, self.raw_config_dir)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"tabela raw '{table}' não tem config persistida em '{self.raw_config_dir}' — "
+                f"rode extract_table()/extract_all() para ela antes de declarar a entidade"
+            ) from exc
+
+    def entidade(
+        self,
+        nome_da_entidade: str,
+        nome_da_tabela_raw: str,
+        nome_da_tabela_raw_custom: str | None = None,
+    ) -> Entity:
+        """Entidade silver = 1 tabela raw (passthrough) ou 2 tabelas raw mescladas por id
+        (`nome_da_tabela_raw_custom`, ex.: a tabela de campos customizados de um objeto
+        Salesforce) — a tabela custom deixa de existir como conceito separado na silver,
+        vira só colunas extras da entidade. Colunas com o mesmo nome nas duas tabelas
+        (exceto a própria chave de junção) recebem o sufixo `_custom` automaticamente,
+        pra nunca colidir sem avisar."""
+        id_column = self._raw_table_query(nome_da_tabela_raw)["partition_column"]
+
+        if nome_da_tabela_raw_custom is None:
+            entity = Entity(name=nome_da_entidade, id_column=id_column, sources=[Source(table=nome_da_tabela_raw)])
+        else:
+            base_cfg = self._raw_table_query(nome_da_tabela_raw)
+            custom_cfg = self._raw_table_query(nome_da_tabela_raw_custom)
+            custom_id_column = custom_cfg["partition_column"]
+            colisao = (set(base_cfg["columns"]) & set(custom_cfg["columns"])) - {custom_id_column}
+            rename = {c: f"{c}_custom" for c in colisao}
+            entity = Entity(
+                name=nome_da_entidade,
+                id_column=id_column,
+                sources=[
+                    Source(table=nome_da_tabela_raw),
+                    Source(table=nome_da_tabela_raw_custom, rename=rename),
+                ],
+                joins=[Join(left_on=id_column, right_on=rename.get(custom_id_column, custom_id_column), how="left")],
+            )
+
+        self.entities[nome_da_entidade] = entity
+        return entity
+
+    def relacionamento(
+        self,
+        nome_relacionamento: str,
+        nome_da_entidade_a: str,
+        nome_da_entidade_b: str,
+        nome_da_tabela_rel_raw: str,
+        nome_fk_a: str,
+        nome_fk_b: str,
+    ) -> Entity:
+        """Relacionamento silver = 1 tabela raw, vinculando duas entidades já
+        registradas neste `SilverModel` (via `entidade()`) por suas colunas de FK."""
+        for nome_entidade in (nome_da_entidade_a, nome_da_entidade_b):
+            if nome_entidade not in self.entities:
+                raise ValueError(
+                    f"entidade '{nome_entidade}' não foi registrada ainda — chame "
+                    f".entidade(...) para ela antes de declarar o relacionamento '{nome_relacionamento}'"
+                )
+
+        id_column = self._raw_table_query(nome_da_tabela_rel_raw)["partition_column"]
+        entity = Entity(
+            name=nome_relacionamento,
+            id_column=id_column,
+            sources=[Source(table=nome_da_tabela_rel_raw)],
+            foreign_keys=[
+                ForeignKey(column=nome_fk_a, entity=nome_da_entidade_a, entity_column=self.entities[nome_da_entidade_a].id_column),
+                ForeignKey(column=nome_fk_b, entity=nome_da_entidade_b, entity_column=self.entities[nome_da_entidade_b].id_column),
+            ],
+        )
+        self.entities[nome_relacionamento] = entity
+        return entity
+
+    def build_all(self, output_dir: str, schema: str, config_dir: str = DEFAULT_CONFIG_DIR, num_buckets: int = 32) -> pd.DataFrame:
+        """Materializa todas as entidades/relacionamentos registrados, na ordem em
+        que foram declarados (`entidade`/`relacionamento`)."""
+        return build_all(list(self.entities.values()), self.raw, output_dir, schema, config_dir, num_buckets)
+
+    def check_foreign_keys(self, silver: TableLoader) -> pd.DataFrame:
+        """Roda `check_foreign_key` para cada FK declarada nos relacionamentos registrados."""
+        return check_foreign_keys(list(self.entities.values()), silver)
